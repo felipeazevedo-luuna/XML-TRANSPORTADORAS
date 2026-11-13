@@ -14,6 +14,7 @@ on:
           - FITLOG TRANSPORTES
           - MIRA TRANSPORTES
           - RODONAVES
+          - JAMEF + RODONAVES (ao mesmo tempo)
       reprocessar:
         description: 'Ignorar o histórico e reprocessar os pedidos Ready To Ship (só vale para JAMEF)'
         required: false
@@ -24,9 +25,32 @@ permissions:
   contents: write
 
 jobs:
+  preparar:
+    runs-on: ubuntu-latest
+    outputs:
+      transportadoras: ${{ steps.lista.outputs.transportadoras }}
+    steps:
+      # "JAMEF + RODONAVES" vira dois jobs em paralelo, cada um com seu acesso
+      # ao OMS. As demais opções seguem uma por disparo, como sempre foi.
+      - id: lista
+        env:
+          ESCOLHA: ${{ github.event.inputs.transportadora }}
+        run: |
+          if [ "$ESCOLHA" = "JAMEF + RODONAVES (ao mesmo tempo)" ]; then
+            echo 'transportadoras=["JAMEF","RODONAVES"]' >> "$GITHUB_OUTPUT"
+          else
+            echo "transportadoras=[\"$ESCOLHA\"]" >> "$GITHUB_OUTPUT"
+          fi
+
   rodar-bot:
+    needs: preparar
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    strategy:
+      # Um job não derruba o outro: se a JAMEF falhar, a Rodonaves segue.
+      fail-fast: false
+      matrix:
+        transportadora: ${{ fromJson(needs.preparar.outputs.transportadoras) }}
 
     steps:
       - name: Checkout do repositório
@@ -57,7 +81,7 @@ jobs:
         env:
           SISTEMA_EMAIL: ${{ secrets.SISTEMA_EMAIL }}
           SISTEMA_SENHA: ${{ secrets.SISTEMA_SENHA }}
-          TRANSPORTADORA: ${{ github.event.inputs.transportadora }}
+          TRANSPORTADORA: ${{ matrix.transportadora }}
           REPROCESSAR: ${{ github.event.inputs.reprocessar }}
           GMAIL_USUARIO: ${{ secrets.GMAIL_USUARIO }}
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
@@ -65,6 +89,10 @@ jobs:
           JAMEF_API_SENHA: ${{ secrets.JAMEF_API_SENHA }}
           PLATINUM_EMAIL: ${{ secrets.PLATINUM_EMAIL }}
           PLATINUM_SENHA: ${{ secrets.PLATINUM_SENHA }}
+          # Acesso separado do OMS para a Rodonaves: é o que permite ela subir
+          # etiqueta ao mesmo tempo que a JAMEF, sem disputar a mesma sessão.
+          PLATINUM_EMAIL_RODONAVES: ${{ secrets.PLATINUM_EMAIL_RODONAVES }}
+          PLATINUM_SENHA_RODONAVES: ${{ secrets.PLATINUM_SENHA_RODONAVES }}
           # Rodonaves (RTE): acesso à API da malha
           RTE_USER: ${{ secrets.RTE_USER }}
           RTE_PASS: ${{ secrets.RTE_PASS }}
@@ -80,12 +108,15 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: logs-${{ github.run_id }}
+          # Precisa ser único por job da matriz, senão o upload falha com nome repetido.
+          name: logs-${{ github.run_id }}-${{ matrix.transportadora }}
           path: logs/
           retention-days: 7
 
       - name: Commitar histórico atualizado
         if: always()
+        env:
+          TRANSPORTADORA: ${{ matrix.transportadora }}
         run: |
           git config --local user.email "bot@zebrands.mx"
           git config --local user.name "Bot XML Transportadoras"
@@ -94,23 +125,31 @@ jobs:
             echo "Nada novo no histórico."
             exit 0
           fi
-          git commit -m "🤖 Histórico atualizado"
-          # O checkout acontece no início e este passo roda ~17 min depois. Se
-          # qualquer commit entrou na main nesse intervalo, o push era recusado
-          # com "! [rejected] main -> main (fetch first)" e TODO o trabalho do bot
-          # ia embora. Era a causa das 25 últimas falhas deste workflow.
+          git commit -m "🤖 Histórico atualizado ($TRANSPORTADORA)"
+          # O checkout é do começo do job e este passo roda ~17 min depois. Se
+          # outro commit entrou na main nesse intervalo, o push era recusado e
+          # TODO o trabalho do bot ia embora.
           for tentativa in 1 2 3 4 5; do
             if git push; then
               echo "Histórico publicado (tentativa $tentativa)."
               exit 0
             fi
-            echo "Push recusado — trazendo a main e tentando de novo ($tentativa/5)."
-            if ! git pull --rebase origin main; then
-              git rebase --abort || true
-              echo "Conflito no histórico; não dá para resolver sozinho."
-              exit 1
+            echo "Push recusado — juntando com a main e tentando de novo ($tentativa/5)."
+            git fetch origin main
+            # JAMEF e Rodonaves rodam em paralelo e escrevem o mesmo arquivo.
+            # A resposta certa aqui é a UNIÃO das duas listas: escolher um lado
+            # apagaria os pedidos que o outro job acabou de processar.
+            git show FETCH_HEAD:historico_processados.json > /tmp/remoto.json 2>/dev/null || echo '{"docnames_processados":[]}' > /tmp/remoto.json
+            jq -s '{ultima_execucao: (.[0].ultima_execucao // .[1].ultima_execucao), docnames_processados: (((.[0].docnames_processados // []) + (.[1].docnames_processados // [])) | unique)}' historico_processados.json /tmp/remoto.json > /tmp/juntado.json
+            git reset --hard FETCH_HEAD
+            mv /tmp/juntado.json historico_processados.json
+            git add historico_processados.json
+            if git diff --staged --quiet; then
+              echo "A main já tinha tudo o que este job processou."
+              exit 0
             fi
-            sleep $((tentativa * 5))
+            git commit -m "🤖 Histórico atualizado ($TRANSPORTADORA)"
+            sleep $((tentativa * 3))
           done
           echo "Não consegui publicar o histórico depois de 5 tentativas."
           exit 1
