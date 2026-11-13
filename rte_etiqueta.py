@@ -379,8 +379,27 @@ if __name__ == "__main__":
     with open(a.xml, "rb") as f:
         xml = f.read()
     pdf = gerar_etiqueta_pdf(xml, mock=a.mock)
-    saida = a.saida or f"RTE_{ler_nfe(xml)['nnf']}.pdf"
+    nnf = ler_nfe(xml)["nnf"]
+
+    if a.mock:
+        # A amostra usa a malha de exemplo da RTE (destino 721, setor URU) e NÃO
+        # serve para carga. Em nov/2026 treze notas foram etiquetadas assim sem
+        # ninguém perceber, porque o arquivo saía com o mesmo nome de uma etiqueta
+        # real (RTE_<NF>.pdf). Agora o próprio nome entrega o que ela é.
+        saida = a.saida or f"AMOSTRA_RTE_{nnf}.pdf"
+        if not os.path.basename(saida).upper().startswith("AMOSTRA"):
+            print("ERRO: com --mock o nome do arquivo precisa começar com AMOSTRA.")
+            print("      É o que impede a amostra de ser confundida com etiqueta real.")
+            sys.exit(2)
+    else:
+        saida = a.saida or f"RTE_{nnf}.pdf"
+
     with open(saida, "wb") as f:
         f.write(pdf)
-    print(f"OK: {saida}")
+
+    if a.mock:
+        print(f"AMOSTRA gerada: {saida}")
+        print("ATENÇÃO: rota de exemplo da RTE (destino 721 / setor URU). NÃO USAR EM CARGA.")
+    else:
+        print(f"OK: {saida}")
     sys.exit(0)
