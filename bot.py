@@ -755,15 +755,35 @@ def _primeiro(page, *seletores):
     return page.locator(seletores[-1]).first
 
 
+def _platinum_credenciais() -> tuple[str, str, str]:
+    """Acesso do OMS conforme a transportadora desta execução.
+
+    A Rodonaves tem acesso próprio (PLATINUM_EMAIL_RODONAVES /
+    PLATINUM_SENHA_RODONAVES) para subir etiqueta ao mesmo tempo que a JAMEF,
+    sem as duas disputarem a mesma sessão do OMS. Sem esse acesso configurado,
+    cai no acesso padrão e avisa — aí as duas NÃO podem rodar juntas.
+    """
+    transportadora = os.getenv("TRANSPORTADORA", "").upper()
+    if "RODONAVES" in transportadora:
+        email = os.getenv("PLATINUM_EMAIL_RODONAVES", "").strip()
+        senha = os.getenv("PLATINUM_SENHA_RODONAVES", "").strip()
+        if email and senha:
+            return email, senha, "Rodonaves"
+        print("   ⚠️  PLATINUM_EMAIL_RODONAVES / PLATINUM_SENHA_RODONAVES não configurados —")
+        print("       usando o acesso padrão. Não rode a Rodonaves junto com a JAMEF assim.")
+    return (os.getenv("PLATINUM_EMAIL", "").strip(),
+            os.getenv("PLATINUM_SENHA", "").strip(),
+            "padrão")
+
+
 def platinum_fazer_login(page) -> bool:
     """Login no Platinum/TPL OMS (tela com E-mail, Senha e botão Entrar)."""
-    email = os.getenv("PLATINUM_EMAIL", "").strip()
-    senha = os.getenv("PLATINUM_SENHA", "").strip()
+    email, senha, qual_acesso = _platinum_credenciais()
     if not email or not senha:
-        print("   ⚠️  PLATINUM_EMAIL / PLATINUM_SENHA não configurados — pulando Platinum.")
+        print("   ⚠️  Credenciais do Platinum não configuradas — pulando Platinum.")
         return False
 
-    print("\n🔐  Fazendo login no Platinum OMS...")
+    print(f"\n🔐  Fazendo login no Platinum OMS (acesso {qual_acesso})...")
     try:
         page.goto(PLATINUM_URL_BASE, wait_until="domcontentloaded", timeout=30_000)
         campo_senha = page.locator("input[type='password']").first
