@@ -127,16 +127,39 @@ def ler_nfe(xml_bytes):
 _token_cache = {"valor": None, "expira": 0}
 
 
+# Esperas (s) entre as tentativas do token. A API da RTE às vezes não aceita a
+# conexão por alguns minutos (ConnectTimeout); sem isso, um único soluço fazia
+# a execução inteira ficar sem etiquetas.
+ESPERAS_TOKEN = (15, 45, 90)
+
+
 def obter_token():
     """Token vale 8 h (expires_in 28800); reaproveita enquanto não vencer."""
     if _token_cache["valor"] and time.time() < _token_cache["expira"]:
         return _token_cache["valor"]
-    r = requests.post(URL_TOKEN, timeout=30, data={
+    dados = {
         "auth_type": os.getenv("RTE_AUTH_TYPE", "dev"),
         "grant_type": "password",
         "username": os.environ["RTE_USER"],
         "password": os.environ["RTE_PASS"],
-    })
+    }
+    tentativas = len(ESPERAS_TOKEN) + 1
+    for tentativa in range(1, tentativas + 1):
+        try:
+            r = requests.post(URL_TOKEN, timeout=30, data=dados)
+            if r.status_code < 500:
+                break                      # sucesso ou erro de credencial: não adianta repetir
+            motivo = f"HTTP {r.status_code}"
+        except (requests.ConnectionError, requests.Timeout) as e:
+            if tentativa == tentativas:
+                raise
+            motivo = type(e).__name__
+        if tentativa == tentativas:
+            break
+        espera = ESPERAS_TOKEN[tentativa - 1]
+        print(f"   ⏳  Token da API RTE: {motivo} (tentativa {tentativa}/{tentativas}) — "
+              f"tentando de novo em {espera}s")
+        time.sleep(espera)
     r.raise_for_status()
     j = r.json()
     _token_cache["valor"] = j["access_token"]
