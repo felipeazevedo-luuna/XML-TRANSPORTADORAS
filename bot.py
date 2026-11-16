@@ -8,11 +8,13 @@
 import os
 import sys
 import json
+import time
 import zipfile
 import getpass
 import urllib.request
 from pathlib import Path
 from collections import Counter
+import requests
 from datetime import datetime
 from dotenv import load_dotenv
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
@@ -703,10 +705,20 @@ def jamef_processar_xmls(arquivos: list[Path]) -> dict:
     enviados, falhas = [], []
     for xml in xmls:
         nf = _nf_do_xml(xml)
-        try:
-            ok, resp = api.enviar_nf(xml)
-        except Exception as e:
-            ok, resp = False, str(e)
+        for tentativa in (1, 2, 3):
+            try:
+                ok, resp = api.enviar_nf(xml)
+                break
+            except (requests.ConnectionError, requests.Timeout) as e:
+                # A API da JAMEF às vezes demora >30 s (Read timed out); a NF seria
+                # reenviada na próxima execução de qualquer jeito, então tenta já.
+                ok, resp = False, str(e)
+                if tentativa < 3:
+                    print(f"   ⏳  NF {nf}: API JAMEF não respondeu — tentando de novo ({tentativa}/2)")
+                    time.sleep(10 * tentativa)
+            except Exception as e:
+                ok, resp = False, str(e)
+                break
         if ok:
             print(f"   ✅  NF {nf} cadastrada na JAMEF.")
             enviados.append(xml)
@@ -804,8 +816,24 @@ def platinum_fazer_login(page) -> bool:
         print(f"   ✅  Login Platinum OK ({page.url})")
         return True
     except Exception as e:
-        print(f"   ❌  Falha no login Platinum: {str(e).splitlines()[0]}")
+        # O OMS avisa em popup (ex.: "Senha expirada, redefina sua senha") e fica
+        # parado na tela de login; sem ler o popup, o log só mostrava "Timeout".
+        aviso = ""
+        try:
+            popup = page.locator(".swal2-popup, .swal-modal, [role='dialog']").first
+            if popup.is_visible():
+                aviso = " ".join(popup.inner_text().split())
+        except Exception:
+            pass
         capturar_screenshot(page, "platinum_erro_login")
+        if "expirad" in aviso.lower():
+            print(f"   ❌  Login Platinum (acesso {qual_acesso}): SENHA EXPIRADA no OMS.")
+            print("       Renove a senha no OMS e atualize o secret "
+                  f"{'PLATINUM_SENHA_RODONAVES' if qual_acesso == 'Rodonaves' else 'PLATINUM_SENHA'} no GitHub.")
+        elif aviso:
+            print(f"   ❌  Falha no login Platinum — o OMS respondeu: {aviso[:200]}")
+        else:
+            print(f"   ❌  Falha no login Platinum: {str(e).splitlines()[0]}")
         return False
 
 
