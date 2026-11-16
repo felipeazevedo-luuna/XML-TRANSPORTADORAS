@@ -46,6 +46,13 @@ jobs:
     needs: preparar
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    # Uma execução por transportadora de cada vez: o cron dispara a cada 30 min e,
+    # se a anterior ainda estiver rodando, a nova ESPERA (não roda junto). Sem isso,
+    # duas execuções pegavam os mesmos pedidos (o histórico só é salvo no fim) e
+    # disputavam o mesmo login do OMS (16/11: #701/#702 e #703/#704).
+    concurrency:
+      group: bot-xml-${{ matrix.transportadora }}
+      cancel-in-progress: false
     strategy:
       # Um job não derruba o outro: se a JAMEF falhar, a Rodonaves segue.
       fail-fast: false

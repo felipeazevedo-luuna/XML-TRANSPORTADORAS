@@ -989,6 +989,16 @@ def _agora_brasilia() -> datetime:
     return datetime.now(ZoneInfo("America/Sao_Paulo")).replace(tzinfo=None, second=0, microsecond=0)
 
 
+def platinum_buscar_pedido(page, n_nf: str) -> dict | None:
+    """Pedido 'Zecore <NF>-1' no OMS, pela mesma chamada da busca da tela inicial
+    (usa a sessão já logada da página). Ex.: {"id": 11351028, "cliente_id": 81,
+    "pedido": "Zecore 123051-1", "situacao": "PROCESSANDO", "cancelado": false}"""
+    r = page.request.post(f"{PLATINUM_URL_BASE}/home/buscarPedido", timeout=30_000,
+                          form={"id": "", "pedido": "", "nf": n_nf, "sro": ""})
+    pedidos = (r.json() or {}).get("pedidos") or []
+    return next((p for p in pedidos if p.get("pedido") == f"Zecore {n_nf}-1"), None)
+
+
 def platinum_confirmar_etiqueta(page, n_nf: str, desde: datetime) -> bool:
     """Confere no detalhe do pedido no OMS se a etiqueta ficou registrada.
 
@@ -998,11 +1008,7 @@ def platinum_confirmar_etiqueta(page, n_nf: str, desde: datetime) -> bool:
     """
     pedido_oms = f"Zecore {n_nf}-1"
     try:
-        # Mesma chamada da busca da tela inicial do OMS (usa a sessão já logada da página)
-        r = page.request.post(f"{PLATINUM_URL_BASE}/home/buscarPedido", timeout=30_000,
-                              form={"id": "", "pedido": "", "nf": n_nf, "sro": ""})
-        pedidos = (r.json() or {}).get("pedidos") or []
-        pedido = next((p for p in pedidos if p.get("pedido") == pedido_oms), None)
+        pedido = platinum_buscar_pedido(page, n_nf)
         if not pedido:
             print(f"   ⚠️  NF {n_nf}: pedido {pedido_oms} não encontrado no OMS.")
             return False
@@ -1043,21 +1049,34 @@ def platinum_subir_e_confirmar(page, pdf_path: Path, n_nf: str, tentativas: int 
 
 def platinum_subir_etiquetas(context, etiquetas: list[tuple[str, Path]]) -> dict:
     """Sobe no Platinum as etiquetas JAMEF geradas. etiquetas = [(nf, caminho_pdf)]."""
-    ok, falha = [], []
+    ok, falha, cancelados = [], [], []
     if not etiquetas:
-        return {"platinum_ok": ok, "platinum_falha": falha}
+        return {"platinum_ok": ok, "platinum_falha": falha, "platinum_cancelado": cancelados}
 
     print(f"\n📦  Subindo {len(etiquetas)} etiqueta(s) no Platinum OMS...")
     pagina = context.new_page()
     try:
         if not platinum_fazer_login(pagina):
             return {"platinum_ok": ok, "platinum_falha": [f"NF {nf}" for nf, _ in etiquetas],
-                    "platinum_pulado": True}
+                    "platinum_cancelado": cancelados, "platinum_pulado": True}
         for i, (n_nf, pdf) in enumerate(etiquetas, 1):
             print(f"   [{i}/{len(etiquetas)}]", end="")
             if not pdf.exists():
                 print(f"   ⚠️  NF {n_nf}: arquivo da etiqueta não encontrado.")
                 falha.append(f"NF {n_nf}")
+                continue
+            try:
+                pedido = platinum_buscar_pedido(pagina, n_nf)
+            except Exception as e:
+                pedido = {}   # consulta falhou: tenta subir mesmo assim
+                print(f"   ⚠️  NF {n_nf}: consulta ao OMS falhou ({str(e).splitlines()[0]})")
+            if pedido is None:
+                # Pedido ainda não integrado no OMS: fica fora do histórico e volta na próxima
+                print(f"   ⏳  NF {n_nf}: pedido ainda não está no OMS — fica para a próxima execução.")
+                falha.append(f"NF {n_nf}")
+            elif pedido.get("cancelado") or str(pedido.get("situacao", "")).upper() == "CANCELADO":
+                print(f"   🚫  NF {n_nf}: pedido CANCELADO no OMS — etiqueta não enviada.")
+                cancelados.append(f"NF {n_nf}")
             elif platinum_subir_e_confirmar(pagina, pdf, n_nf):
                 ok.append(f"NF {n_nf}")
             else:
@@ -1068,8 +1087,8 @@ def platinum_subir_etiquetas(context, etiquetas: list[tuple[str, Path]]) -> dict
         except Exception:
             pass
 
-    print(f"   📊  Platinum: {len(ok)} OK, {len(falha)} falha(s)")
-    return {"platinum_ok": ok, "platinum_falha": falha}
+    print(f"   📊  Platinum: {len(ok)} OK, {len(falha)} falha(s), {len(cancelados)} cancelado(s) no OMS")
+    return {"platinum_ok": ok, "platinum_falha": falha, "platinum_cancelado": cancelados}
 
 
 def main():
@@ -1157,6 +1176,7 @@ def main():
             todos_arquivos = []
             pedidos_sem_xml = []
             docnames_ok = set()
+            docname_por_nf = {}   # NF (sem zeros) -> docname, pela chave no nome do arquivo
 
             # Busca rápida em lote pela API; o que não vier cai na busca pela tela
             arquivos_api = buscar_arquivos_em_lote(page, [p["docname"] for p in pedidos_novos])
@@ -1174,6 +1194,9 @@ def main():
                     baixou = False
                     for url in urls:
                         nome = url.split("/")[-1]
+                        chave = nome.split(".")[0]
+                        if len(chave) == 44 and chave.isdigit():
+                            docname_por_nf[str(int(chave[25:34]))] = docname
                         dest = PASTA_XMLS / nome
                         if dest.exists():
                             todos_arquivos.append(dest)
@@ -1266,9 +1289,12 @@ def main():
                 if jamef_resultado.get("platinum_pulado"):
                     resumo_jamef += "\n📦 *Platinum:* não executado (login/credenciais — ver log)"
                 elif plat_ok or plat_falha:
-                    resumo_jamef += f"\n📦 *Platinum:* {len(plat_ok)} etiqueta(s) OK, {len(plat_falha)} falha(s)"
+                    resumo_jamef += f"\n📦 *Platinum:* {len(plat_ok)} etiqueta(s) confirmada(s) no OMS, {len(plat_falha)} falha(s)"
                     if plat_falha:
                         resumo_jamef += f"\n   ⚠️ " + " | ".join(plat_falha[:10])
+                plat_cancel = jamef_resultado.get("platinum_cancelado", [])
+                if plat_cancel:
+                    resumo_jamef += f"\n   🚫 Cancelado(s) no OMS: " + " | ".join(plat_cancel[:10])
 
                 drive_link = (drive_link or "") + resumo_jamef
 
@@ -1293,7 +1319,20 @@ def main():
                 print("\n⚠️  Etiquetas/Platinum/NOTFIS não foram concluídos — pedidos ficam fora do histórico.")
                 salvar_historico(historico | docnames_free)
             else:
-                salvar_historico(historico | docnames_ok | docnames_free)
+                # NF que não chegou ao fim (cadastro JAMEF, etiqueta ou OMS não confirmado)
+                # fica fora do histórico para ser tentada de novo na próxima execução.
+                nfs_pendentes = set()
+                for res in (jamef_resultado or {}, rte_resultado or {}):
+                    for item in (res.get("falha", []) + res.get("etiquetas_falha", [])
+                                 + res.get("platinum_falha", [])):
+                        m = re.match(r"NF (\d+)", str(item))
+                        if m:
+                            nfs_pendentes.add(m.group(1).lstrip("0"))
+                docnames_pendentes = {docname_por_nf[n] for n in nfs_pendentes if n in docname_por_nf}
+                if docnames_pendentes:
+                    print(f"\n🔁  {len(docnames_pendentes)} pedido(s) ficam fora do histórico para nova tentativa: "
+                          + ", ".join(sorted(nfs_pendentes)))
+                salvar_historico(historico | (docnames_ok - docnames_pendentes) | docnames_free)
             print(f"\n💾  Histórico atualizado.")
 
             if not is_ci:
