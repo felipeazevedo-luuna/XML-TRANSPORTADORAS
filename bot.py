@@ -11,6 +11,7 @@ import json
 import time
 import zipfile
 import getpass
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from collections import Counter
@@ -319,6 +320,69 @@ def ler_pedidos(page, transportadora_alvo: str) -> list[dict]:
 # ════════════════════════════════════════════════════════════
 #  BUSCAR XML + PDF DE CADA PEDIDO
 # ════════════════════════════════════════════════════════════
+def buscar_arquivos_em_lote(page, docnames: list[str]) -> dict[str, list[str]]:
+    """XML+PDF de vários pedidos de uma vez, pela API do Zecore (mesma sessão do login).
+
+    A busca pela tela (buscar_arquivos_do_pedido) leva 10-20 s por pedido. Aqui são
+    duas consultas para o lote todo:
+      1) Sales Invoice com sales_order na lista (enviadas, sem devolução)
+      2) File anexados a essas faturas, só .xml/.pdf
+    Teste em 30 pedidos reais: ~6 s no total. Pedido que não vier aqui (ou se a API
+    falhar) cai na busca antiga pela tela, pedido a pedido.
+    """
+    resultado: dict[str, list[str]] = {}
+    if not docnames:
+        return resultado
+
+    def consultar(doctype: str, filtros: list, campos: list) -> list[dict]:
+        resp = page.request.get(
+            f"{BASE_URL}/api/resource/{urllib.parse.quote(doctype)}",
+            params={
+                "filters": json.dumps(filtros),
+                "fields": json.dumps(campos),
+                "limit_page_length": "0",
+                "order_by": "creation desc",
+            },
+            timeout=60_000,
+        )
+        if not resp.ok:
+            raise RuntimeError(f"API {doctype} respondeu {resp.status}")
+        return resp.json().get("data", [])
+
+    print(f"\n⚡  Buscando XML+PDF de {len(docnames)} pedido(s) pela API do Zecore...")
+    inicio = datetime.now()
+    try:
+        for i in range(0, len(docnames), 50):
+            lote = docnames[i:i + 50]
+            faturas = consultar(
+                "Sales Invoice",
+                [["sales_order", "in", lote], ["docstatus", "=", 1], ["is_return", "=", 0]],
+                ["name", "sales_order"],
+            )
+            fatura_para_pedido = {f["name"]: f["sales_order"] for f in faturas}
+            if not fatura_para_pedido:
+                continue
+            arquivos = consultar(
+                "File",
+                [["attached_to_doctype", "=", "Sales Invoice"],
+                 ["attached_to_name", "in", list(fatura_para_pedido)]],
+                ["file_url", "attached_to_name"],
+            )
+            for arq in arquivos:
+                url = arq.get("file_url") or ""
+                if "/private/files/" not in url or not url.lower().endswith((".xml", ".pdf")):
+                    continue
+                pedido = fatura_para_pedido.get(arq.get("attached_to_name"))
+                if pedido:
+                    resultado.setdefault(pedido, []).append(BASE_URL + url if url.startswith("/") else url)
+    except Exception as e:
+        print(f"   ⚠️  Busca pela API falhou ({e}) — usando a busca pela tela para o que faltar.")
+
+    segundos = (datetime.now() - inicio).total_seconds()
+    print(f"   ✅  API: {len(resultado)}/{len(docnames)} pedido(s) com arquivos em {segundos:.1f} s.")
+    return resultado
+
+
 def buscar_arquivos_do_pedido(page, docname: str) -> list[str]:
     print(f"\n   🔎  Buscando XML+PDF para: {docname}")
     TIMEOUT = 8_000
@@ -1035,10 +1099,13 @@ def main():
             pedidos_sem_xml = []
             docnames_ok = set()
 
+            # Busca rápida em lote pela API; o que não vier cai na busca pela tela
+            arquivos_api = buscar_arquivos_em_lote(page, [p["docname"] for p in pedidos_novos])
+
             for pedido in pedidos_novos:
                 docname = pedido["docname"]
                 try:
-                    urls = buscar_arquivos_do_pedido(page, docname)
+                    urls = arquivos_api.get(docname) or buscar_arquivos_do_pedido(page, docname)
                     urls = list(dict.fromkeys(urls))
 
                     if not urls:
