@@ -1,0 +1,50 @@
+name: Reenviar etiquetas RTE
+
+on:
+  workflow_dispatch:
+    inputs:
+      nfs:
+        description: 'Números das NFs Rodonaves, separados por vírgula (ex.: 122954, 123051)'
+        required: true
+        type: string
+
+jobs:
+  reenviar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Instalar dependências
+        run: pip install -r requirements.txt reportlab requests
+
+      - name: Instalar Chromium (Playwright)
+        run: python -m playwright install --with-deps chromium
+
+      - name: Gerar e subir etiquetas
+        env:
+          NFS: ${{ github.event.inputs.nfs }}
+          SISTEMA_EMAIL: ${{ secrets.SISTEMA_EMAIL }}
+          SISTEMA_SENHA: ${{ secrets.SISTEMA_SENHA }}
+          RTE_USER: ${{ secrets.RTE_USER }}
+          RTE_PASS: ${{ secrets.RTE_PASS }}
+          PLATINUM_EMAIL: ${{ secrets.PLATINUM_EMAIL }}
+          PLATINUM_SENHA: ${{ secrets.PLATINUM_SENHA }}
+          PLATINUM_EMAIL_RODONAVES: ${{ secrets.PLATINUM_EMAIL_RODONAVES }}
+          PLATINUM_SENHA_RODONAVES: ${{ secrets.PLATINUM_SENHA_RODONAVES }}
+          PYTHONUNBUFFERED: "1"
+        run: xvfb-run -a python reenviar_etiquetas.py
+
+      - name: Salvar etiquetas e prints
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reenvio-etiquetas-${{ github.run_id }}
+          path: |
+            xmls_baixados/etiquetas_rte_reenvio/
+            logs/
+          retention-days: 7
