@@ -8,6 +8,7 @@
 import os
 import sys
 import json
+import re
 import time
 import zipfile
 import getpass
@@ -16,7 +17,7 @@ import urllib.request
 from pathlib import Path
 from collections import Counter
 import requests
-from datetime import datetime
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
 
@@ -973,13 +974,71 @@ def platinum_upload_etiqueta(page, pdf_path: Path, n_nf: str) -> bool:
             capturar_screenshot(page, f"platinum_recusou_NF{n_nf}")
             return False
 
-        print(f"   ✅  NF {n_nf}: etiqueta enviada ao Platinum.")
+        print(f"   📤  NF {n_nf}: etiqueta enviada ao Platinum — conferindo no OMS...")
         return True
 
     except Exception as e:
         print(f"   ❌  Erro no Platinum NF {n_nf}: {str(e).splitlines()[0]}")
         capturar_screenshot(page, f"platinum_erro_NF{n_nf}")
         return False
+
+
+def _agora_brasilia() -> datetime:
+    """Hora de Brasília sem fuso (o OMS mostra assim; o runner do GitHub está em UTC)."""
+    from zoneinfo import ZoneInfo
+    return datetime.now(ZoneInfo("America/Sao_Paulo")).replace(tzinfo=None, second=0, microsecond=0)
+
+
+def platinum_confirmar_etiqueta(page, n_nf: str, desde: datetime) -> bool:
+    """Confere no detalhe do pedido no OMS se a etiqueta ficou registrada.
+
+    O popup do upload ("Fique ligado ! OK") é igual no sucesso e na falha — em 16/11
+    a NF 123051 passou por ele e não ficou no OMS. A prova é o histórico do pedido:
+    linha "ETIQUETA VINCULADA MANUALMENTE" ou "etiqueta | UPLOAD" com data >= envio.
+    """
+    pedido_oms = f"Zecore {n_nf}-1"
+    try:
+        # Mesma chamada da busca da tela inicial do OMS (usa a sessão já logada da página)
+        r = page.request.post(f"{PLATINUM_URL_BASE}/home/buscarPedido", timeout=30_000,
+                              form={"id": "", "pedido": "", "nf": n_nf, "sro": ""})
+        pedidos = (r.json() or {}).get("pedidos") or []
+        pedido = next((p for p in pedidos if p.get("pedido") == pedido_oms), None)
+        if not pedido:
+            print(f"   ⚠️  NF {n_nf}: pedido {pedido_oms} não encontrado no OMS.")
+            return False
+        html = page.request.get(
+            f"{PLATINUM_URL_BASE}/pedidos/detalhe/{pedido['id']}/{pedido.get('cliente_id', 81)}",
+            timeout=30_000).text()
+        for linha in re.findall(r"<tr[^>]*>(.*?)</tr>", html, flags=re.S | re.I):
+            t = " ".join(re.sub(r"<[^>]+>", " ", linha).split())
+            if not ("ETIQUETA VINCULADA" in t.upper() or ("etiqueta" in t.lower() and "UPLOAD" in t)):
+                continue
+            m = re.search(r"(\d{2}/\d{2}/\d{4} \d{2}:\d{2})", t)
+            if m and datetime.strptime(m.group(1), "%d/%m/%Y %H:%M") >= desde:
+                return True
+        return False
+    except Exception as e:
+        print(f"   ⚠️  NF {n_nf}: não consegui conferir no OMS ({str(e).splitlines()[0]})")
+        return False
+
+
+def platinum_subir_e_confirmar(page, pdf_path: Path, n_nf: str, tentativas: int = 2) -> bool:
+    """Sobe a etiqueta e só considera OK depois de confirmar no OMS; reenvia se não ficou."""
+    for tentativa in range(1, tentativas + 1):
+        desde = _agora_brasilia() - timedelta(minutes=1)   # folga de relógio
+        if not platinum_upload_etiqueta(page, pdf_path, n_nf):
+            return False                                   # recusa explícita/erro: não insiste
+        for espera in (0, 5_000):                          # o OMS pode levar alguns segundos
+            if espera:
+                page.wait_for_timeout(espera)
+            if platinum_confirmar_etiqueta(page, n_nf, desde):
+                print(f"   ✅  NF {n_nf}: etiqueta confirmada no OMS.")
+                return True
+        if tentativa < tentativas:
+            print(f"   🔁  NF {n_nf}: o OMS não registrou a etiqueta — reenviando ({tentativa}/{tentativas - 1}).")
+    print(f"   ❌  NF {n_nf}: etiqueta NÃO apareceu no OMS depois de {tentativas} envio(s).")
+    capturar_screenshot(page, f"platinum_nao_confirmada_NF{n_nf}")
+    return False
 
 
 def platinum_subir_etiquetas(context, etiquetas: list[tuple[str, Path]]) -> dict:
@@ -999,7 +1058,7 @@ def platinum_subir_etiquetas(context, etiquetas: list[tuple[str, Path]]) -> dict
             if not pdf.exists():
                 print(f"   ⚠️  NF {n_nf}: arquivo da etiqueta não encontrado.")
                 falha.append(f"NF {n_nf}")
-            elif platinum_upload_etiqueta(pagina, pdf, n_nf):
+            elif platinum_subir_e_confirmar(pagina, pdf, n_nf):
                 ok.append(f"NF {n_nf}")
             else:
                 falha.append(f"NF {n_nf}")
