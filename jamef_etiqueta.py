@@ -149,7 +149,12 @@ def gerar_etiquetas(itens, api=None, pasta=PASTA_SAIDA, tentativas=1, espera=15)
             res[str(item)] = {"ok": False, "pdf": None, "volumes": 0, "erro": str(e)}
             continue
         for t in range(tentativas):
-            ok, dado = api.etiqueta(chave, "ZPL")
+            try:
+                ok, dado = api.etiqueta(chave, "ZPL")
+            except requests.RequestException as e:
+                # Timeout/queda da API JAMEF: conta como tentativa e segue; antes, um
+                # ReadTimeout derrubava a execução inteira (16/11, #706).
+                ok, dado = False, f"API JAMEF não respondeu: {str(e).splitlines()[0][:150]}"
             if ok or t == tentativas - 1:
                 break
             print(f"...  {chave}: etiqueta ainda nao disponivel, nova tentativa em {espera}s")
