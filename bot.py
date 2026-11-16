@@ -917,9 +917,81 @@ def _platinum_fechar_popup(page, timeout: int = 10_000) -> str:
         return ""
 
 
+# NFs que já tiveram o envio direto (HTTP) nesta execução: o reenvio do
+# platinum_subir_e_confirmar vai pela tela, para não repetir um caminho que não confirmou.
+_PLATINUM_HTTP_TENTADO: set[str] = set()
+
+
+def _platinum_aviso(html: str) -> tuple[str, str]:
+    """Mensagem e tipo do aviso que o OMS devolve na página, ex.: aviso("...", "sucesso")."""
+    m = re.search(r"""aviso\(\s*(["'])(.*?)\1\s*,\s*(["'])(\w*)\3""", html, flags=re.S)
+    if m:
+        return " ".join(re.sub(r"<[^>]+>", " ", m.group(2)).split()), m.group(4).lower()
+    m = re.search(r"""(?:swal|Swal\.fire)\(\s*\{?[^)]*?(?:text|title)\s*:\s*(["'])(.*?)\1""", html, flags=re.S)
+    return (" ".join(m.group(2).split()) if m else ""), ""
+
+
+def _platinum_upload_http(page, pdf_path: Path, n_nf: str) -> bool | None:
+    """Sobe a etiqueta com as mesmas chamadas da tela, sem abrir a tela (~1 s em vez de ~10 s).
+
+    1) POST /pedidos/existe {pedido}  -> {"erro": ""} ou {"erro": "PEDIDO [...] NÃO ENCONTRADO"}
+    2) POST multipart /pedidoEtiqueta/carregarEtiqueta {pedido, modelo=0 (PDF PADRAO), upload, upload_visivel}
+    Devolve True (enviado), False (recusa explícita do OMS) ou None (resposta inesperada:
+    sessão caída, layout novo etc. — quem chama usa a tela).
+    """
+    pedido_oms = f"Zecore {n_nf}-1"
+    r = page.request.post(f"{PLATINUM_URL_BASE}/pedidos/existe", multipart={"pedido": pedido_oms},
+                          timeout=30_000)
+    if r.status != 200:
+        return None
+    try:
+        erro = (r.json() or {}).get("erro")
+    except Exception:
+        return None                                # não veio JSON (ex.: página de login)
+    if erro is None:
+        return None
+    if erro:
+        print(f"   ❌  NF {n_nf}: OMS respondeu '{erro}'.")
+        return False
+
+    r = page.request.post(f"{PLATINUM_URL_UPLOAD}/carregarEtiqueta", timeout=60_000, multipart={
+        "pedido": pedido_oms,
+        "modelo": "0",                             # PDF - PADRAO (15cm x 11cm)
+        "upload_visivel": pdf_path.name,
+        "upload": {"name": pdf_path.name, "mimeType": "application/pdf", "buffer": pdf_path.read_bytes()},
+    })
+    if r.status != 200 or "login" in r.url.lower():
+        return None
+    texto, tipo = _platinum_aviso(r.text())
+    if texto:
+        print(f"   ℹ️  Platinum respondeu ({tipo or 'sem tipo'}): {texto[:150]}")
+    # O tipo do aviso não serve de prova (o "Fique ligado !" aparece no sucesso e na falha);
+    # só texto de erro explícito é recusa. A prova de sucesso é platinum_confirmar_etiqueta.
+    if any(p in texto.lower() for p in (
+            "erro", "não encontrado", "nao encontrado", "inválid", "invalid", "falha")):
+        print(f"   ❌  NF {n_nf}: Platinum recusou a etiqueta.")
+        return False
+    return True
+
+
 def platinum_upload_etiqueta(page, pdf_path: Path, n_nf: str) -> bool:
     pedido_oms = f"Zecore {n_nf}-1"
     print(f"   🏷️  Platinum — {pedido_oms}")
+
+    if n_nf not in _PLATINUM_HTTP_TENTADO:
+        _PLATINUM_HTTP_TENTADO.add(n_nf)
+        inicio = datetime.now()
+        try:
+            enviado = _platinum_upload_http(page, pdf_path, n_nf)
+        except Exception as e:
+            enviado = None
+            print(f"   ⚠️  NF {n_nf}: envio direto falhou ({str(e).splitlines()[0]}).")
+        if enviado is not None:
+            segundos = (datetime.now() - inicio).total_seconds()
+            if enviado:
+                print(f"   📤  NF {n_nf}: etiqueta enviada direto ao OMS em {segundos:.1f} s — conferindo no OMS...")
+            return enviado
+        print(f"   ↩️  NF {n_nf}: resposta inesperada do envio direto — usando a tela.")
 
     try:
         page.goto(PLATINUM_URL_UPLOAD, wait_until="domcontentloaded", timeout=30_000)
