@@ -67,7 +67,7 @@ def main():
     pasta.mkdir(exist_ok=True)
     caminho = pasta / f"NOTFIS_LUUNA_{agora:%Y%m%d_%H%M}_REENVIO.txt"
     caminho.write_text(notfis.gerar_notfis(xmls, agora), encoding="ascii", newline="")
-    linha311 = next(l for l in caminho.read_text(encoding="ascii").split("\r\n") if l.startswith("311"))
+    linha311 = next(l for l in caminho.read_bytes().decode("ascii").split("\r\n") if l.startswith("311"))
     print(f"📄  NOTFIS gerado: {caminho.name} ({len(xmls)} NF) — embarcador {linha311[3:17]}")
 
     if os.getenv("ENVIAR", "false").lower() != "true":
