@@ -15,6 +15,7 @@ Variáveis (GitHub Secrets / .env):
 """
 
 import os
+import json
 import smtplib
 from pathlib import Path
 from datetime import datetime
@@ -27,6 +28,23 @@ import requests
 
 import rte_etiqueta as rte
 import notfis
+
+# NFs (chave de 44 dígitos) que já foram num NOTFIS enviado à RTE. O pedido pode
+# ficar pendente (ex.: etiqueta sem pedido no OMS) e voltar nas execuções seguintes;
+# sem esse registro, a mesma NF ia para a RTE a cada 30 min (17/11: NF 691 e 123456, 6x).
+ARQUIVO_NOTFIS_ENVIADOS = Path("notfis_enviados.json")
+
+
+def notfis_ja_enviados() -> set[str]:
+    try:
+        return set(json.loads(ARQUIVO_NOTFIS_ENVIADOS.read_text(encoding="utf-8")).get("chaves", []))
+    except (FileNotFoundError, ValueError):
+        return set()
+
+
+def registrar_notfis_enviados(chaves) -> None:
+    todas = sorted(notfis_ja_enviados() | set(chaves))
+    ARQUIVO_NOTFIS_ENVIADOS.write_text(json.dumps({"chaves": todas}, indent=2) + "\n", encoding="utf-8")
 
 COPIA_INTERNA = ["felipe.azevedo@zeb.mx", "israel.lopes@zeb.mx"]
 
@@ -89,33 +107,40 @@ def rodonaves_processar_xmls(arquivos: list[Path], pasta: Path) -> dict:
         etiquetas_pdfs.append((n_nf, caminho))
         xmls_prontos.append(dados)
 
-    # NOTFIS só com as notas que têm etiqueta (nota sem etiqueta não sai).
-    # Um arquivo por CNPJ emitente: o NOTFIS não aceita emitentes misturados e, em
-    # 17/11, uma NF da filial ...0006-19 no meio de 24 da ...0001-04 travou o envio de todas.
-    notfis_paths, notfis_nfs = [], 0
+    # NOTFIS só com as notas que têm etiqueta (nota sem etiqueta não sai) e que ainda
+    # não foram num NOTFIS enviado. Um arquivo só: o embarcador é sempre a matriz.
+    notfis_paths, notfis_chaves, ja_enviado = [], [], False
     if xmls_prontos:
-        agora = datetime.now()
-        por_cnpj: dict[str, list[bytes]] = {}
-        for dados in xmls_prontos:
-            por_cnpj.setdefault(rte.ler_nfe(dados)["emit_doc"], []).append(dados)
-        for cnpj, grupo in sorted(por_cnpj.items()):
-            sufixo = f"_{cnpj[-6:]}" if len(por_cnpj) > 1 else ""
+        enviadas = notfis_ja_enviados()
+        novas = [(d, rte.ler_nfe(d)) for d in xmls_prontos]
+        novas = [(d, nf) for d, nf in novas if _chave(d) not in enviadas]
+        repetidas = len(xmls_prontos) - len(novas)
+        if repetidas:
+            print(f"\n   ℹ️  {repetidas} NF(s) já foram em NOTFIS anterior — não reenviadas.")
+        if not novas:
+            ja_enviado = True
+        else:
+            agora = datetime.now()
             try:
-                conteudo = notfis.gerar_notfis(grupo, agora)
-                caminho = pasta / f"NOTFIS_LUUNA_{agora:%Y%m%d_%H%M}{sufixo}.txt"
+                conteudo = notfis.gerar_notfis([d for d, _ in novas], agora)
+                caminho = pasta / f"NOTFIS_LUUNA_{agora:%Y%m%d_%H%M}.txt"
                 with open(caminho, "w", encoding="ascii", newline="") as f:
                     f.write(conteudo)
                 notfis_paths.append(caminho)
-                notfis_nfs += len(grupo)
-                print(f"\n📄  NOTFIS gerado: {caminho.name} ({len(grupo)} NF, emitente {cnpj})")
+                notfis_chaves = [_chave(d) for d, _ in novas]
+                print(f"\n📄  NOTFIS gerado: {caminho.name} ({len(novas)} NF)")
             except Exception as e:
-                print(f"   ❌  Erro ao gerar o NOTFIS do emitente {cnpj}: {e}")
+                print(f"   ❌  Erro ao gerar o NOTFIS: {e}")
 
     print(f"\n   📊  RTE: {len(ok)} etiqueta(s) OK, {len(falha)} falha(s)")
-    # Só conta como gerado se TODOS os emitentes geraram (senão os pedidos voltam na próxima)
-    completo = bool(notfis_paths) and notfis_nfs == len(xmls_prontos)
     return {"ok": ok, "falha": falha, "etiquetas_pdfs": etiquetas_pdfs,
-            "notfis": notfis_paths if completo else None, "notfis_nfs": notfis_nfs if completo else 0}
+            "notfis": notfis_paths or None, "notfis_nfs": len(notfis_chaves),
+            "notfis_chaves": notfis_chaves, "notfis_ja_enviado": ja_enviado}
+
+
+def _chave(xml_bytes: bytes) -> str:
+    """Chave de acesso (44 dígitos) da NF-e, pelo NOTFIS (mesma leitura do arquivo)."""
+    return notfis.ler_nfe(xml_bytes)["chave"]
 
 
 def enviar_notfis_por_email(notfis_path: Path | list[Path] | None, n_nfs: int) -> bool | None:
@@ -186,6 +211,8 @@ def resumo_chat(res: dict) -> str:
         txt += "\n   👉 Gere as que falharam pelo painel de etiquetas Rodonaves e envie o NOTFIS delas."
 
     email = res.get("notfis_email")
+    if res.get("notfis_ja_enviado"):
+        txt += "\n📄 *NOTFIS:* NF(s) desta rodada já tinham ido em NOTFIS anterior — nada reenviado"
     if res.get("notfis"):
         if email is True:
             txt += f"\n📄 *NOTFIS:* {res.get('notfis_nfs', 0)} NF(s) enviada(s) para a RTE"
@@ -210,6 +237,7 @@ def rodonaves_nao_rodou(res: dict | None) -> bool:
         return False
     if any(res.get(k) for k in ("pulado", "erro_login", "platinum_pulado")):
         return True
-    if res.get("etiquetas_pdfs") and not res.get("notfis"):     # etiquetas prontas, mas o NOTFIS não foi gerado
+    if res.get("etiquetas_pdfs") and not res.get("notfis") and not res.get("notfis_ja_enviado"):
+        # etiquetas prontas, mas o NOTFIS não foi gerado
         return True
     return bool(res.get("notfis")) and res.get("notfis_email") is False

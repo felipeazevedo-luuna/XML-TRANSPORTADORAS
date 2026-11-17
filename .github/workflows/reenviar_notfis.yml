@@ -1,0 +1,48 @@
+name: Reenviar NOTFIS RTE
+
+on:
+  workflow_dispatch:
+    inputs:
+      nfs:
+        description: 'NFs separadas por vírgula. Filial: SÉRIE/NÚMERO (ex.: 14/691, 123456)'
+        required: true
+        type: string
+      enviar:
+        description: 'Enviar o e-mail para a RTE? (desmarcado: só gera o arquivo para conferir)'
+        required: false
+        default: false
+        type: boolean
+
+jobs:
+  reenviar:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Instalar dependências
+        run: pip install -r requirements.txt reportlab requests
+
+      - name: Gerar (e enviar) o NOTFIS
+        env:
+          NFS: ${{ github.event.inputs.nfs }}
+          ENVIAR: ${{ github.event.inputs.enviar }}
+          SISTEMA_EMAIL: ${{ secrets.SISTEMA_EMAIL }}
+          SISTEMA_SENHA: ${{ secrets.SISTEMA_SENHA }}
+          GMAIL_USUARIO: ${{ secrets.GMAIL_USUARIO }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          RTE_ENVIAR_NOTFIS: "true"
+          PYTHONUNBUFFERED: "1"
+        run: python reenviar_notfis.py
+
+      - name: Guardar o NOTFIS
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: notfis-reenvio-${{ github.run_id }}
+          path: xmls_baixados/NOTFIS_*.txt
+          retention-days: 30

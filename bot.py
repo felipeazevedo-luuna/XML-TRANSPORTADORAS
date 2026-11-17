@@ -22,7 +22,7 @@ from dotenv import load_dotenv
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
 
 from jamef_etiqueta import JamefAPI, gerar_etiquetas, resolver_chave
-from rodonaves import rodonaves_processar_xmls, enviar_notfis_por_email, resumo_chat as resumo_rodonaves, rodonaves_nao_rodou
+from rodonaves import rodonaves_processar_xmls, enviar_notfis_por_email, resumo_chat as resumo_rodonaves, rodonaves_nao_rodou, registrar_notfis_enviados
 
 # ── Configurações ──────────────────────────────────────────
 URL_LOGIN         = "https://zecore.zebrands.mx/login#login"
@@ -1341,6 +1341,8 @@ def main():
                 rte_resultado["notfis_email"] = enviar_notfis_por_email(
                     rte_resultado.get("notfis"), rte_resultado.get("notfis_nfs", 0)
                 )
+                if rte_resultado["notfis_email"] is True:
+                    registrar_notfis_enviados(rte_resultado.get("notfis_chaves", []))
 
             # 9. Notifica no Chat
             drive_link = "📧 Enviado por email" if email_ok else None

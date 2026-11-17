@@ -25,7 +25,22 @@ TAM_LINHA = 300   # tamanho de cada linha no arquivo (exemplo da RTE)
 CAIXA_REMETENTE = "LUUNA"          # 000 campo 2
 CAIXA_DESTINATARIO = "RTE RODONAVES"  # 000 campo 3
 NATUREZA = "COLCHOES"              # 313 campo 11 (tipo da mercadoria)
-ESPECIE_PADRAO = "VOLUMES"         # 313 campo 12, se o XML não trouxer <esp>
+ESPECIE_PADRAO = "VOLUMES"
+# Embarcador e responsável pelo frete (311/317): sempre a Zebrands matriz, o CNPJ
+# do contrato com a RTE — também para NF emitida por filial (ex.: ...0006-19, NF 691
+# em 17/11, que foi para a RTE com o CNPJ da filial).
+EMBARCADOR = {
+    "cnpj": "42418313000104",
+    "ie": "127934097112",
+    "nome": "ZEBRANDS COMERCIAL LTDA.",
+    "endereco": "Rua Dona Catharina Maria de Jesus, 418, Sala 6A",
+    "bairro": "Bonsucesso",
+    "cidade": "Guarulhos",
+    "cod_mun": "3518800",
+    "cep": "07175500",
+    "uf": "SP",
+    "fone": "1140403131",
+}         # 313 campo 12, se o XML não trouxer <esp>
 CONDICAO_FRETE = "C"               # C = CIF, F = FOB
 TIPO_ICMS = "S"                    # S = alíquota normal
 MEIO_TRANSPORTE = "1"              # 1 = rodoviário
@@ -222,8 +237,8 @@ def gerar_notfis(xmls, agora=None):
     nfs = [ler_nfe(x) for x in xmls]
     if not nfs:
         raise ValueError("nenhuma NF informada")
-    if len({n["emit"]["cnpj"] for n in nfs}) > 1:
-        raise ValueError("NFs de emitentes diferentes: gere um arquivo por CNPJ emitente")
+    for n in nfs:                       # 311/317 sempre com o CNPJ do contrato (matriz)
+        n["emit"] = dict(EMBARCADOR)
     if len(nfs) > 40 * 500:
         raise ValueError("NFs demais para um único documento 310")
 
