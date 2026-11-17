@@ -89,28 +89,41 @@ def rodonaves_processar_xmls(arquivos: list[Path], pasta: Path) -> dict:
         etiquetas_pdfs.append((n_nf, caminho))
         xmls_prontos.append(dados)
 
-    # NOTFIS só com as notas que têm etiqueta (nota sem etiqueta não sai)
-    notfis_path = None
+    # NOTFIS só com as notas que têm etiqueta (nota sem etiqueta não sai).
+    # Um arquivo por CNPJ emitente: o NOTFIS não aceita emitentes misturados e, em
+    # 17/11, uma NF da filial ...0006-19 no meio de 24 da ...0001-04 travou o envio de todas.
+    notfis_paths, notfis_nfs = [], 0
     if xmls_prontos:
         agora = datetime.now()
-        try:
-            conteudo = notfis.gerar_notfis(xmls_prontos, agora)
-            notfis_path = pasta / f"NOTFIS_LUUNA_{agora:%Y%m%d_%H%M}.txt"
-            with open(notfis_path, "w", encoding="ascii", newline="") as f:
-                f.write(conteudo)
-            print(f"\n📄  NOTFIS gerado: {notfis_path.name} ({len(xmls_prontos)} NF)")
-        except Exception as e:
-            print(f"   ❌  Erro ao gerar o NOTFIS: {e}")
+        por_cnpj: dict[str, list[bytes]] = {}
+        for dados in xmls_prontos:
+            por_cnpj.setdefault(rte.ler_nfe(dados)["emit_doc"], []).append(dados)
+        for cnpj, grupo in sorted(por_cnpj.items()):
+            sufixo = f"_{cnpj[-6:]}" if len(por_cnpj) > 1 else ""
+            try:
+                conteudo = notfis.gerar_notfis(grupo, agora)
+                caminho = pasta / f"NOTFIS_LUUNA_{agora:%Y%m%d_%H%M}{sufixo}.txt"
+                with open(caminho, "w", encoding="ascii", newline="") as f:
+                    f.write(conteudo)
+                notfis_paths.append(caminho)
+                notfis_nfs += len(grupo)
+                print(f"\n📄  NOTFIS gerado: {caminho.name} ({len(grupo)} NF, emitente {cnpj})")
+            except Exception as e:
+                print(f"   ❌  Erro ao gerar o NOTFIS do emitente {cnpj}: {e}")
 
     print(f"\n   📊  RTE: {len(ok)} etiqueta(s) OK, {len(falha)} falha(s)")
+    # Só conta como gerado se TODOS os emitentes geraram (senão os pedidos voltam na próxima)
+    completo = bool(notfis_paths) and notfis_nfs == len(xmls_prontos)
     return {"ok": ok, "falha": falha, "etiquetas_pdfs": etiquetas_pdfs,
-            "notfis": notfis_path, "notfis_nfs": len(xmls_prontos) if notfis_path else 0}
+            "notfis": notfis_paths if completo else None, "notfis_nfs": notfis_nfs if completo else 0}
 
 
-def enviar_notfis_por_email(notfis_path: Path | None, n_nfs: int) -> bool | None:
-    """Envia o NOTFIS para a RTE com cópia interna. Devolve None quando não havia o que enviar."""
+def enviar_notfis_por_email(notfis_path: Path | list[Path] | None, n_nfs: int) -> bool | None:
+    """Envia o(s) NOTFIS (um por CNPJ emitente) para a RTE com cópia interna, num e-mail só.
+    Devolve None quando não havia o que enviar."""
     if not notfis_path:
         return None
+    arquivos = list(notfis_path) if isinstance(notfis_path, (list, tuple)) else [notfis_path]
     if not _envio_notfis_ligado():
         print("   ℹ️  RTE_ENVIAR_NOTFIS=false — NOTFIS gerado, mas não enviado.")
         return None
@@ -130,7 +143,7 @@ def enviar_notfis_por_email(notfis_path: Path | None, n_nfs: int) -> bool | None
         '<html><body style="font-family: Arial, sans-serif; color: #1a1a1a;">'
         f"<p>Olá,</p><p>Segue o arquivo NOTFIS da coleta de hoje ({data_hoje}), "
         f"com {n_nfs} nota(s) fiscal(is).</p>"
-        f"<p>Arquivo: <strong>{notfis_path.name}</strong></p>"
+        f"<p>Arquivo(s): <strong>{', '.join(a.name for a in arquivos)}</strong></p>"
         '<p style="color:#6b7280;font-size:12px;">Enviado automaticamente pelo Bot XML Transportadoras — Zebrands/Luuna</p>'
         "</body></html>"
     )
@@ -140,11 +153,12 @@ def enviar_notfis_por_email(notfis_path: Path | None, n_nfs: int) -> bool | None
         msg = MIMEMultipart()
         msg["From"], msg["To"], msg["Cc"], msg["Subject"] = usuario, ", ".join(para), ", ".join(cc), assunto
         msg.attach(MIMEText(corpo, "html"))
-        parte = MIMEBase("text", "plain")
-        parte.set_payload(notfis_path.read_bytes())
-        encoders.encode_base64(parte)
-        parte.add_header("Content-Disposition", f"attachment; filename={notfis_path.name}")
-        msg.attach(parte)
+        for arquivo in arquivos:
+            parte = MIMEBase("text", "plain")
+            parte.set_payload(arquivo.read_bytes())
+            encoders.encode_base64(parte)
+            parte.add_header("Content-Disposition", f"attachment; filename={arquivo.name}")
+            msg.attach(parte)
         with smtplib.SMTP_SSL("smtp.gmail.com", 465) as servidor:
             servidor.login(usuario, senha)
             servidor.sendmail(usuario, para + cc, msg.as_string())
