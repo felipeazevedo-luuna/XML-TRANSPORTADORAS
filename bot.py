@@ -321,7 +321,7 @@ def ler_pedidos(page, transportadora_alvo: str) -> list[dict]:
 # ════════════════════════════════════════════════════════════
 #  BUSCAR XML + PDF DE CADA PEDIDO
 # ════════════════════════════════════════════════════════════
-def buscar_arquivos_em_lote(page, docnames: list[str]) -> dict[str, list[str]]:
+def buscar_arquivos_em_lote(page, docnames: list[str]) -> tuple[dict[str, list[str]], bool]:
     """XML+PDF de vários pedidos de uma vez, pela API do Zecore (mesma sessão do login).
 
     A busca pela tela (buscar_arquivos_do_pedido) leva 10-20 s por pedido. Aqui são
@@ -332,8 +332,9 @@ def buscar_arquivos_em_lote(page, docnames: list[str]) -> dict[str, list[str]]:
     falhar) cai na busca antiga pela tela, pedido a pedido.
     """
     resultado: dict[str, list[str]] = {}
+    api_ok = False
     if not docnames:
-        return resultado
+        return resultado, True
 
     def consultar(doctype: str, filtros: list, campos: list) -> list[dict]:
         resp = page.request.get(
@@ -376,12 +377,13 @@ def buscar_arquivos_em_lote(page, docnames: list[str]) -> dict[str, list[str]]:
                 pedido = fatura_para_pedido.get(arq.get("attached_to_name"))
                 if pedido:
                     resultado.setdefault(pedido, []).append(BASE_URL + url if url.startswith("/") else url)
+        api_ok = True
     except Exception as e:
         print(f"   ⚠️  Busca pela API falhou ({e}) — usando a busca pela tela para o que faltar.")
 
     segundos = (datetime.now() - inicio).total_seconds()
     print(f"   ✅  API: {len(resultado)}/{len(docnames)} pedido(s) com arquivos em {segundos:.1f} s.")
-    return resultado
+    return resultado, api_ok
 
 
 def buscar_arquivos_do_pedido(page, docname: str) -> list[str]:
@@ -1251,12 +1253,21 @@ def main():
             docname_por_nf = {}   # NF (sem zeros) -> docname, pela chave no nome do arquivo
 
             # Busca rápida em lote pela API; o que não vier cai na busca pela tela
-            arquivos_api = buscar_arquivos_em_lote(page, [p["docname"] for p in pedidos_novos])
+            arquivos_api, api_ok = buscar_arquivos_em_lote(page, [p["docname"] for p in pedidos_novos])
+            sem_nf = [p["docname"] for p in pedidos_novos if p["docname"] not in arquivos_api] if api_ok else []
+            if sem_nf:
+                # A API respondeu e o pedido não tem fatura com XML/PDF: a NF ainda não foi
+                # emitida/anexada no Zecore (17/11: 50 pedidos JAMEF lidos às 09:30, NFs só
+                # às 09:43). A busca pela tela não acharia nada e custava 15-20 s por pedido.
+                print(f"   ⏳  {len(sem_nf)} pedido(s) ainda sem NF/XML no Zecore — ficam para a próxima execução.")
 
             for pedido in pedidos_novos:
                 docname = pedido["docname"]
                 try:
-                    urls = arquivos_api.get(docname) or buscar_arquivos_do_pedido(page, docname)
+                    if api_ok:
+                        urls = arquivos_api.get(docname, [])
+                    else:   # API falhou (no todo ou em parte): usa o que veio e a tela no resto
+                        urls = arquivos_api.get(docname) or buscar_arquivos_do_pedido(page, docname)
                     urls = list(dict.fromkeys(urls))
 
                     if not urls:
