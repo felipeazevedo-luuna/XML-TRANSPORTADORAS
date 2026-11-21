@@ -863,8 +863,19 @@ def jamef_processar_xmls(arquivos: list[Path]) -> dict:
     # 1) Cadastra as NFs na JAMEF
     print(f"\n📤  Enviando {len(xmls)} NF(s) para a API JAMEF...")
     enviados, falhas = [], []
-    for xml in xmls:
+    # API fora do ar: em 21/11 a JAMEF devolveu 500 (e depois deixou de responder) para
+    # todas as NFs; com 3 tentativas de 30 s por NF, 131 NFs passavam do limite de 60 min
+    # do job e travavam as execuções seguintes. Se as primeiras NFs falham todas, para
+    # de insistir: o resto fica como falha e volta na próxima execução.
+    LIMITE_FALHAS_SEGUIDAS = 5
+    for idx, xml in enumerate(xmls):
         nf = _nf_do_xml(xml)
+        if not enviados and len(falhas) >= LIMITE_FALHAS_SEGUIDAS:
+            restantes = xmls[idx:]
+            print(f"   🛑  API JAMEF falhou nas {len(falhas)} primeiras NFs — parando; "
+                  f"{len(restantes)} NF(s) ficam para a próxima execução.")
+            falhas.extend(f"NF {_nf_do_xml(x)} — não enviada (API JAMEF fora do ar)" for x in restantes)
+            break
         for tentativa in (1, 2, 3):
             try:
                 ok, resp = api.enviar_nf(xml)

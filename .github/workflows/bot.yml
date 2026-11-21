@@ -108,6 +108,8 @@ jobs:
           RTE_ENVIAR_NOTFIS: ${{ vars.RTE_ENVIAR_NOTFIS || 'true' }}
           HEADLESS: "false"
           CI: "true"
+          # Log em tempo real no Actions (sem isso o print só aparece no fim)
+          PYTHONUNBUFFERED: "1"
         # Tela virtual: o Chrome roda "visível" (Zecore e Platinum)
         run: xvfb-run -a python bot.py
 
