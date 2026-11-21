@@ -129,6 +129,7 @@ jobs:
           git config --local user.name "Bot XML Transportadoras"
           git add historico_processados.json
           [ -f notfis_enviados.json ] && git add notfis_enviados.json
+          [ -f email_enviados.json ] && git add email_enviados.json
           if git diff --staged --quiet; then
             echo "Nada novo no histórico."
             exit 0
@@ -153,10 +154,15 @@ jobs:
             git show FETCH_HEAD:notfis_enviados.json > /tmp/nf_remoto.json 2>/dev/null || echo '{"chaves":[]}' > /tmp/nf_remoto.json
             [ -f notfis_enviados.json ] || echo '{"chaves":[]}' > notfis_enviados.json
             jq -s '{chaves: (((.[0].chaves // []) + (.[1].chaves // [])) | unique)}' notfis_enviados.json /tmp/nf_remoto.json > /tmp/nf_juntado.json
+            # email_enviados.json: também a união (pedido que já foi no ZIP da JAMEF)
+            git show FETCH_HEAD:email_enviados.json > /tmp/em_remoto.json 2>/dev/null || echo '{"docnames":[]}' > /tmp/em_remoto.json
+            [ -f email_enviados.json ] || echo '{"docnames":[]}' > email_enviados.json
+            jq -s '{docnames: (((.[0].docnames // []) + (.[1].docnames // [])) | unique)}' email_enviados.json /tmp/em_remoto.json > /tmp/em_juntado.json
             git reset --hard FETCH_HEAD
             mv /tmp/juntado.json historico_processados.json
             mv /tmp/nf_juntado.json notfis_enviados.json
-            git add historico_processados.json notfis_enviados.json
+            mv /tmp/em_juntado.json email_enviados.json
+            git add historico_processados.json notfis_enviados.json email_enviados.json
             if git diff --staged --quiet; then
               echo "A main já tinha tudo o que este job processou."
               exit 0

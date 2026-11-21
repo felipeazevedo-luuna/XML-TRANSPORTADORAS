@@ -36,6 +36,10 @@ PASTA_XMLS       = Path("xmls_baixados")
 PASTA_LOGS       = Path("logs")
 PASTA_ETIQUETAS  = PASTA_XMLS / "etiquetas_jamef"
 ARQUIVO_HISTORICO = Path("historico_processados.json")
+# Pedidos JAMEF cujo XML/PDF já foi no email do ZIP. Um pedido que fica fora do
+# histórico (API JAMEF/OMS falhou) volta a cada 30 min; sem esta lista o mesmo ZIP
+# era reenviado a cada execução (21/11: 131 pedidos, API JAMEF com erro 500).
+ARQUIVO_EMAIL_ENVIADOS = Path("email_enviados.json")
 
 # ── Platinum / TPL OMS ─────────────────────────────────────
 PLATINUM_URL_BASE   = "https://oms.tpl.com.br"
@@ -102,6 +106,18 @@ def carregar_historico() -> set:
         except Exception:
             return set()
     return set()
+
+
+def carregar_email_enviados() -> set:
+    try:
+        return set(json.loads(ARQUIVO_EMAIL_ENVIADOS.read_text(encoding="utf-8")).get("docnames", []))
+    except Exception:
+        return set()
+
+
+def registrar_email_enviados(docnames) -> None:
+    todos = sorted(carregar_email_enviados() | set(docnames))
+    ARQUIVO_EMAIL_ENVIADOS.write_text(json.dumps({"docnames": todos}, indent=2) + "\n", encoding="utf-8")
 
 
 def salvar_historico(docnames: set):
@@ -1251,6 +1267,7 @@ def main():
             pedidos_sem_xml = []
             docnames_ok = set()
             docname_por_nf = {}   # NF (sem zeros) -> docname, pela chave no nome do arquivo
+            arquivos_por_docname = {}   # docname -> arquivos baixados dele (para o email)
 
             # Busca rápida em lote pela API; o que não vier cai na busca pela tela
             arquivos_api, api_ok = buscar_arquivos_em_lote(page, [p["docname"] for p in pedidos_novos])
@@ -1283,11 +1300,13 @@ def main():
                         dest = PASTA_XMLS / nome
                         if dest.exists():
                             todos_arquivos.append(dest)
+                            arquivos_por_docname.setdefault(docname, []).append(dest)
                             baixou = True
                             continue
                         caminho = baixar_arquivo(page, url, nome)
                         if caminho:
                             todos_arquivos.append(caminho)
+                            arquivos_por_docname.setdefault(docname, []).append(caminho)
                             baixou = True
 
                     if baixou:
@@ -1316,10 +1335,34 @@ def main():
             # 7. Envia ZIP por email
             #    Rodonaves não recebe o ZIP: a RTE recebe o NOTFIS (passo 8)
             eh_rodonaves = "RODONAVES" in transportadora.upper()
-            email_ok = False if eh_rodonaves else enviar_zip_por_email(
-                zip_path, transportadora, pedidos_novos,
-                todos_arquivos, pedidos_sem_xml=pedidos_sem_xml
-            )
+            eh_jamef = "JAMEF" in transportadora.upper()
+            email_ok = False
+            if eh_jamef:
+                # Só manda no email o que ainda não foi: pedido pendente (API JAMEF/OMS)
+                # volta a cada execução e não deve gerar o mesmo ZIP de novo.
+                ja_enviados = set() if reprocessar else carregar_email_enviados()
+                docs_email = [d for d in arquivos_por_docname if d not in ja_enviados]
+                pulados = len(arquivos_por_docname) - len(docs_email)
+                if pulados:
+                    print(f"   ℹ️  {pulados} pedido(s) já foram no email do ZIP antes — não reenviados.")
+                if docs_email:
+                    arquivos_email = [a for d in docs_email for a in arquivos_por_docname[d]]
+                    zip_email = zip_path if not pulados else criar_zip(arquivos_email, transportadora)
+                    pedidos_email = [p for p in pedidos_novos
+                                     if p["docname"] in set(docs_email) or p in pedidos_sem_xml]
+                    email_ok = enviar_zip_por_email(
+                        zip_email, transportadora, pedidos_email,
+                        arquivos_email, pedidos_sem_xml=pedidos_sem_xml
+                    )
+                    if email_ok:
+                        registrar_email_enviados(docs_email)
+                else:
+                    print("   ℹ️  Nenhum pedido novo para o email do ZIP — email não enviado.")
+            elif not eh_rodonaves:
+                email_ok = enviar_zip_por_email(
+                    zip_path, transportadora, pedidos_novos,
+                    todos_arquivos, pedidos_sem_xml=pedidos_sem_xml
+                )
 
             # 8. Se for JAMEF: cadastra as NFs na API, gera as etiquetas e sobe no Platinum
             jamef_resultado = None
