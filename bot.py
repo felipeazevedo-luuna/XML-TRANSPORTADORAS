@@ -51,6 +51,38 @@ PASTA_LOGS.mkdir(exist_ok=True)
 
 load_dotenv()
 
+
+# ── Sinais para o GitHub Actions ───────────────────────────
+# O run terminava "success" mesmo sem ler nenhum pedido (20/11: filtro do Report
+# 3PL não carregou nas 24 execuções do dia) ou com todas as NFs recusadas pela
+# JAMEF (21/11: erro 500 em 131 NFs). Quem acompanha pelo status do run não via nada.
+class FalhaBot(Exception):
+    """Falha que impede o bot de fazer o trabalho: o run deve terminar com erro."""
+
+
+def _texto_ci(texto) -> str:
+    return str(texto).replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
+
+
+def anotar_ci(nivel: str, titulo: str, mensagem: str) -> None:
+    """Anotação visível no resumo do run (nivel: error, warning ou notice)."""
+    if os.getenv("GITHUB_ACTIONS") == "true":
+        titulo = _texto_ci(titulo).replace(",", " ").replace(":", " -")
+        print(f"::{nivel} title={titulo}::{_texto_ci(mensagem)}")
+
+
+def resumo_ci(linhas: list[str]) -> None:
+    """Acrescenta linhas (Markdown) ao Job Summary do run."""
+    arquivo = os.getenv("GITHUB_STEP_SUMMARY")
+    if not arquivo:
+        return
+    try:
+        with open(arquivo, "a", encoding="utf-8") as f:
+            f.write("\n".join(linhas) + "\n")
+    except OSError:
+        pass
+
+
 # Cache de IDs de subpastas do Drive (evita criar duplicatas)
 _drive_folder_cache = {}
 
@@ -173,8 +205,10 @@ def filtrar_por_status(page):
         print("✅  Filtro de status aplicado!")
         capturar_screenshot(page, "debug_02_filtro_status")
     except PlaywrightTimeout:
-        print("⚠️  Filtro de status não encontrado.")
+        print("❌  Filtro de status não encontrado.")
         capturar_screenshot(page, "debug_02_erro_status")
+        raise FalhaBot("Filtro de status do Report 3PL não encontrado (a página do Zecore "
+                       "não carregou os filtros) — nenhum pedido foi lido.")
 
 
 def filtrar_por_carrier(page, carrier: str):
@@ -190,8 +224,10 @@ def filtrar_por_carrier(page, carrier: str):
         print(f"✅  Filtro de carrier aplicado: {carrier}")
         capturar_screenshot(page, f"debug_02b_carrier")
     except PlaywrightTimeout:
-        print("⚠️  Filtro de carrier não encontrado.")
+        print("❌  Filtro de carrier não encontrado.")
         capturar_screenshot(page, "debug_02b_erro_carrier")
+        raise FalhaBot(f"Filtro de carrier ({carrier}) do Report 3PL não encontrado (a página do "
+                       "Zecore não carregou os filtros) — nenhum pedido foi lido.")
 
 
 # ════════════════════════════════════════════════════════════
@@ -733,6 +769,47 @@ def enviar_notificacao_vazia(motivo: str, pedidos_free=None, transportadora=""):
     _enviar_mensagem_chat("\n".join(linhas))
 
 
+def registrar_resultado_ci(transportadora: str, n_pedidos: int, n_sem_xml: int,
+                           jamef: dict | None, rte: dict | None) -> None:
+    """Job Summary com as contagens do run e aviso quando JAMEF/RTE/OMS falham."""
+    linhas = [f"### {transportadora}", "", "| Etapa | OK | Falha/pendente |", "|---|---|---|",
+              f"| Pedidos novos com XML no Zecore | {n_pedidos - n_sem_xml} | {n_sem_xml} sem XML |"]
+    avisos = []
+    for nome, res in (("JAMEF", jamef), ("RTE", rte)):
+        if not res:
+            continue
+        if res.get("pulado"):
+            avisos.append(("error", f"{nome} não rodou", "credenciais da API não configuradas"))
+            continue
+        if res.get("erro_login"):
+            avisos.append(("error", f"{nome} não rodou", "falha no login da API"))
+        ok, falha = res.get("ok", []), res.get("falha", [])
+        linhas.append(f"| API {nome} | {len(ok)} | {len(falha)} |")
+        if falha and not res.get("erro_login"):
+            avisos.append(("warning", f"API {nome} - {len(falha)} falha(s) de {len(ok) + len(falha)}",
+                           " | ".join(map(str, falha[:5]))))
+        et_falha = res.get("etiquetas_falha", [])
+        if et_falha:
+            avisos.append(("warning", f"Etiquetas {nome} - {len(et_falha)} falha(s)",
+                           " | ".join(map(str, et_falha[:5]))))
+        if res.get("platinum_pulado"):
+            avisos.append(("error", "Platinum OMS não rodou", "login/credenciais do OMS"))
+        p_ok, p_falha = res.get("platinum_ok", []), res.get("platinum_falha", [])
+        if p_ok or p_falha:
+            linhas.append(f"| Platinum OMS | {len(p_ok)} | {len(p_falha)} |")
+        if p_falha:
+            avisos.append(("warning", f"Platinum OMS - {len(p_falha)} etiqueta(s) não subiram",
+                           "pedido ainda não está no OMS ou upload recusado; fica para a próxima execução"))
+        if res.get("notfis_email") is False:
+            avisos.append(("error", "NOTFIS RTE não enviado", "o email do NOTFIS falhou"))
+    for nivel, titulo, msg in avisos:
+        anotar_ci(nivel, f"{transportadora} - {titulo}", msg or titulo)
+    if avisos:
+        linhas.append("")
+        linhas += [f"- {'❌' if n == 'error' else '⚠️'} **{t}**: {m}" for n, t, m in avisos]
+    resumo_ci(linhas)
+
+
 def enviar_notificacao_erro(erro: str, transportadora=""):
     agora = datetime.now().strftime("%d/%m/%Y %H:%M")
     _enviar_mensagem_chat(
@@ -1207,8 +1284,7 @@ def main():
         try:
             # 1. Login
             if not fazer_login(page, email, senha):
-                enviar_notificacao_erro("Falha no login.", transportadora)
-                return
+                raise FalhaBot("Falha no login do Zecore.")
 
             # 2. Report + filtros
             navegar_para_report(page)
@@ -1217,6 +1293,7 @@ def main():
             pedidos = ler_pedidos(page, transportadora)
 
             if not pedidos:
+                resumo_ci([f"### {transportadora}", "Nenhum pedido em *Ready To Ship* no Report 3PL."])
                 enviar_notificacao_vazia(
                     f"Nenhum pedido com status 'Ready To Ship' encontrado.",
                     transportadora=transportadora
@@ -1387,6 +1464,9 @@ def main():
                 if rte_resultado["notfis_email"] is True:
                     registrar_notfis_enviados(rte_resultado.get("notfis_chaves", []))
 
+            registrar_resultado_ci(transportadora, len(pedidos_novos), len(pedidos_sem_xml),
+                                   jamef_resultado, rte_resultado)
+
             # 9. Notifica no Chat
             drive_link = "📧 Enviado por email" if email_ok else None
             if jamef_resultado and jamef_resultado.get("pulado"):
@@ -1467,7 +1547,12 @@ def main():
                 page.wait_for_timeout(5_000)
 
         except Exception as e:
-            print(f"\n💥  Erro inesperado: {e}")
+            if isinstance(e, FalhaBot):
+                print(f"\n💥  {e}")
+            else:
+                print(f"\n💥  Erro inesperado: {e}")
+            anotar_ci("error", f"Bot {transportadora}", str(e))
+            resumo_ci([f"### {transportadora}", f"❌ **Falhou:** {e}"])
             capturar_screenshot(page, "erro_inesperado")
             try:
                 enviar_notificacao_erro(str(e), transportadora)
