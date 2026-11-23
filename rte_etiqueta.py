@@ -188,8 +188,14 @@ def consultar_malha(nf):
     # CEP com 8, bairro e cidade com pelo menos 3 caracteres, UF com 2.
     if len(params["ZipCode"]) != 8:
         raise ValueError(f"CEP do destinatário inválido para a API RTE: {params['ZipCode']!r}")
-    if len(params["District"]) < 3:
-        raise ValueError(f"Bairro com menos de 3 caracteres, a API RTE recusa: {params['District']!r}")
+    if len(params["District"].strip()) < 3:
+        # A API exige 3+ caracteres no bairro, mas a rota sai pelo CEP. Bairro curto
+        # de verdade ("JK", 23/11, NF 124514) travava a NF para sempre; manda
+        # "BAIRRO JK" só na consulta. Etiqueta e NOTFIS seguem com o bairro do XML.
+        curto = params["District"].strip()
+        if not curto:
+            raise ValueError("Bairro vazio no XML, a API RTE recusa")
+        params["District"] = f"BAIRRO {curto}"
     headers = {"Authorization": f"Bearer {obter_token()}", "accept": "application/json"}
     r = requests.get(URL_MALHA, params=params, headers=headers, timeout=30)   # GET com query string
     if r.status_code == 400 and "AddressNumber" in r.text and params["AddressNumber"]:
