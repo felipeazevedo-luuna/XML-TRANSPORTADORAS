@@ -40,6 +40,10 @@ ARQUIVO_HISTORICO = Path("historico_processados.json")
 # histórico (API JAMEF/OMS falhou) volta a cada 30 min; sem esta lista o mesmo ZIP
 # era reenviado a cada execução (21/11: 131 pedidos, API JAMEF com erro 500).
 ARQUIVO_EMAIL_ENVIADOS = Path("email_enviados.json")
+# NFs (chave de acesso) que o bot já processou em cada pedido, como "docname|chave".
+# Serve para achar refaturamento: o pedido já está no histórico, mas ganhou uma NF
+# nova (24/11: pedido da NF 122392, de 12/11, devolvido e refaturado como NF 124879).
+ARQUIVO_NFS_PROCESSADAS = Path("nfs_processadas.json")
 
 # ── Platinum / TPL OMS ─────────────────────────────────────
 PLATINUM_URL_BASE   = "https://oms.tpl.com.br"
@@ -150,6 +154,80 @@ def carregar_email_enviados() -> set:
 def registrar_email_enviados(docnames) -> None:
     todos = sorted(carregar_email_enviados() | set(docnames))
     ARQUIVO_EMAIL_ENVIADOS.write_text(json.dumps({"docnames": todos}, indent=2) + "\n", encoding="utf-8")
+
+
+def carregar_nfs_processadas() -> dict[str, set[str]]:
+    """docname -> chaves de NF já processadas nele."""
+    try:
+        itens = json.loads(ARQUIVO_NFS_PROCESSADAS.read_text(encoding="utf-8")).get("itens", [])
+    except Exception:
+        return {}
+    mapa: dict[str, set[str]] = {}
+    for item in itens:
+        docname, _, chave = str(item).partition("|")
+        if docname and chave:
+            mapa.setdefault(docname, set()).add(chave)
+    return mapa
+
+
+def registrar_nfs_processadas(pares) -> None:
+    """Grava pares (docname, chave). A lista só cresce, como as outras do histórico."""
+    novos = {f"{d}|{c}" for d, c in pares if d and c}
+    if not novos:
+        return
+    try:
+        atuais = set(json.loads(ARQUIVO_NFS_PROCESSADAS.read_text(encoding="utf-8")).get("itens", []))
+    except Exception:
+        atuais = set()
+    if novos <= atuais:
+        return
+    ARQUIVO_NFS_PROCESSADAS.write_text(
+        json.dumps({"itens": sorted(atuais | novos)}, indent=2) + "\n", encoding="utf-8")
+
+
+def chaves_dos_arquivos(urls) -> set[str]:
+    """Chaves de acesso (44 dígitos) tiradas do nome dos XML."""
+    chaves = set()
+    for url in urls or []:
+        nome = url.split("/")[-1]
+        chave = nome.split(".")[0]
+        if nome.lower().endswith(".xml") and len(chave) == 44 and chave.isdigit():
+            chaves.add(chave)
+    return chaves
+
+
+def achar_refaturados(page, pedidos_no_historico: list[dict]) -> list[dict]:
+    """Pedidos do histórico que ganharam NF nova (refaturamento) e precisam rodar de novo.
+
+    Pedido sem NF registrada (anterior a esta checagem) só tem a NF atual registrada,
+    sem reprocessar: não dá para saber se ela já passou pelo bot.
+    """
+    if not pedidos_no_historico:
+        return []
+    registradas = carregar_nfs_processadas()
+    try:
+        arquivos, api_ok = buscar_arquivos_em_lote(page, [p["docname"] for p in pedidos_no_historico])
+    except Exception as e:
+        print(f"   ⚠️  Checagem de refaturamento falhou ({e}) — seguindo sem ela.")
+        return []
+    if not api_ok:
+        print("   ⚠️  Checagem de refaturamento sem a API do Zecore — seguindo sem ela.")
+        return []
+
+    refaturados, primeira_vez = [], []
+    for pedido in pedidos_no_historico:
+        docname = pedido["docname"]
+        atuais = chaves_dos_arquivos(arquivos.get(docname))
+        if not atuais:
+            continue
+        if docname not in registradas:
+            primeira_vez += [(docname, c) for c in atuais]
+        elif atuais - registradas[docname]:
+            nfs = ", ".join(str(int(c[25:34])) for c in sorted(atuais - registradas[docname]))
+            print(f"   🔄  {docname} foi refaturado (NF nova: {nfs}) — processando de novo.")
+            refaturados.append(pedido)
+    registrar_nfs_processadas(primeira_vez)
+    return refaturados
 
 
 def salvar_historico(docnames: set):
@@ -411,8 +489,14 @@ def buscar_arquivos_em_lote(page, docnames: list[str]) -> tuple[dict[str, list[s
             faturas = consultar(
                 "Sales Invoice",
                 [["sales_order", "in", lote], ["docstatus", "=", 1], ["is_return", "=", 0]],
-                ["name", "sales_order"],
+                ["name", "sales_order", "status"],
             )
+            # Refaturamento: a NF antiga recebe uma devolução ("Credit Note Issued") e o
+            # pedido ganha outra fatura. Se o pedido tem fatura válida, a devolvida sai;
+            # se só tem a devolvida (devolução parcial, por exemplo), ela fica.
+            validas = {f["sales_order"] for f in faturas if f.get("status") != "Credit Note Issued"}
+            faturas = [f for f in faturas
+                       if f.get("status") != "Credit Note Issued" or f["sales_order"] not in validas]
             fatura_para_pedido = {f["name"]: f["sales_order"] for f in faturas}
             if not fatura_para_pedido:
                 continue
@@ -1322,6 +1406,10 @@ def main():
                 pedidos_novos = list(pedidos)
             else:
                 pedidos_novos = [p for p in pedidos if p["docname"] not in historico]
+                # Pedido do histórico com NF nova (refaturado) volta a ser processado
+                no_historico = [p for p in pedidos if p["docname"] in historico
+                                and not p["docname"].upper().startswith("FREE-")]
+                pedidos_novos += achar_refaturados(page, no_historico)
             ja_processados = len(pedidos) - len(pedidos_novos)
 
             if ja_processados > 0:
@@ -1355,6 +1443,7 @@ def main():
             pedidos_sem_xml = []
             docnames_ok = set()
             docname_por_nf = {}   # NF (sem zeros) -> docname, pela chave no nome do arquivo
+            chaves_por_docname = {}   # docname -> chaves dos XML processados (refaturamento)
             arquivos_por_docname = {}   # docname -> arquivos baixados dele (para o email)
 
             # Busca rápida em lote pela API; o que não vier cai na busca pela tela
@@ -1374,6 +1463,7 @@ def main():
                     else:   # API falhou (no todo ou em parte): usa o que veio e a tela no resto
                         urls = arquivos_api.get(docname) or buscar_arquivos_do_pedido(page, docname)
                     urls = list(dict.fromkeys(urls))
+                    chaves_por_docname[docname] = chaves_dos_arquivos(urls)
 
                     if not urls:
                         pedidos_sem_xml.append(pedido)
@@ -1552,6 +1642,9 @@ def main():
                     print(f"\n🔁  {len(docnames_pendentes)} pedido(s) ficam fora do histórico para nova tentativa: "
                           + ", ".join(sorted(nfs_pendentes)))
                 salvar_historico(historico | (docnames_ok - docnames_pendentes) | docnames_free)
+                registrar_nfs_processadas(
+                    (d, c) for d in (docnames_ok - docnames_pendentes)
+                    for c in chaves_por_docname.get(d, ()))
             print(f"\n💾  Histórico atualizado.")
 
             if not is_ci:

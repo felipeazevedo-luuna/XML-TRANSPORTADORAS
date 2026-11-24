@@ -132,6 +132,7 @@ jobs:
           git add historico_processados.json
           [ -f notfis_enviados.json ] && git add notfis_enviados.json
           [ -f email_enviados.json ] && git add email_enviados.json
+          [ -f nfs_processadas.json ] && git add nfs_processadas.json
           if git diff --staged --quiet; then
             echo "Nada novo no histórico."
             exit 0
@@ -160,11 +161,16 @@ jobs:
             git show FETCH_HEAD:email_enviados.json > /tmp/em_remoto.json 2>/dev/null || echo '{"docnames":[]}' > /tmp/em_remoto.json
             [ -f email_enviados.json ] || echo '{"docnames":[]}' > email_enviados.json
             jq -s '{docnames: (((.[0].docnames // []) + (.[1].docnames // [])) | unique)}' email_enviados.json /tmp/em_remoto.json > /tmp/em_juntado.json
+            # nfs_processadas.json: também a união (pedido|NF já processada, para refaturamento)
+            git show FETCH_HEAD:nfs_processadas.json > /tmp/np_remoto.json 2>/dev/null || echo '{"itens":[]}' > /tmp/np_remoto.json
+            [ -f nfs_processadas.json ] || echo '{"itens":[]}' > nfs_processadas.json
+            jq -s '{itens: (((.[0].itens // []) + (.[1].itens // [])) | unique)}' nfs_processadas.json /tmp/np_remoto.json > /tmp/np_juntado.json
             git reset --hard FETCH_HEAD
             mv /tmp/juntado.json historico_processados.json
             mv /tmp/nf_juntado.json notfis_enviados.json
             mv /tmp/em_juntado.json email_enviados.json
-            git add historico_processados.json notfis_enviados.json email_enviados.json
+            mv /tmp/np_juntado.json nfs_processadas.json
+            git add historico_processados.json notfis_enviados.json email_enviados.json nfs_processadas.json
             if git diff --staged --quiet; then
               echo "A main já tinha tudo o que este job processou."
               exit 0
