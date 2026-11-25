@@ -275,7 +275,18 @@ def filtrar_por_status(page):
     print("\n🔍  Filtrando por 'Ready To Ship'...")
     campo = page.locator("input.dt-filter[data-col-index='8']")
     try:
-        campo.wait_for(timeout=15_000)
+        try:
+            campo.wait_for(timeout=15_000)
+        except PlaywrightTimeout:
+            # 23, 24 e 25/11 às 08:00 (1ª execução do dia): o Report 3PL abriu sem os
+            # filtros e o bot desistia. Recarregar a página uma vez costuma resolver.
+            print("   ⚠️  Filtros do Report 3PL não apareceram — recarregando a página uma vez...")
+            try:
+                page.reload(wait_until="networkidle", timeout=45_000)
+            except PlaywrightTimeout:
+                pass
+            page.wait_for_timeout(4_000)
+            campo.wait_for(timeout=20_000)
         campo.click()
         campo.fill("Ready To Ship")
         campo.press("Enter")
@@ -907,8 +918,17 @@ def enviar_notificacao_erro(erro: str, transportadora=""):
 #  SCREENSHOT
 # ════════════════════════════════════════════════════════════
 def capturar_screenshot(page, nome: str):
+    """Print só para depuração: nunca pode derrubar o bot.
+
+    24/11 12:00 e 25/11 08:30: o login no OMS falhou, o print ficou esperando as
+    fontes da página carregarem, estourou 30 s e o erro parou a parte RODONAVES
+    com as etiquetas já geradas na RTE.
+    """
     caminho = PASTA_LOGS / f"{nome}.png"
-    page.screenshot(path=str(caminho), full_page=True)
+    try:
+        page.screenshot(path=str(caminho), full_page=True, timeout=10_000)
+    except Exception as e:
+        print(f"   ⚠️  Print '{nome}' não foi salvo ({str(e).splitlines()[0][:120]}) — seguindo.")
 
 
 # ════════════════════════════════════════════════════════════
