@@ -22,7 +22,7 @@ from dotenv import load_dotenv
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
 
 from jamef_etiqueta import JamefAPI, gerar_etiquetas, resolver_chave
-from rodonaves import rodonaves_processar_xmls, enviar_notfis_por_email, resumo_chat as resumo_rodonaves, rodonaves_nao_rodou, registrar_notfis_enviados
+from rodonaves import rodonaves_processar_xmls, enviar_notfis_por_email, resumo_chat as resumo_rodonaves, rodonaves_nao_rodou, registrar_notfis_enviados, enviar_notfis_pendentes
 
 # ── Configurações ──────────────────────────────────────────
 URL_LOGIN         = "https://zecore.zebrands.mx/login#login"
@@ -271,28 +271,65 @@ def navegar_para_report(page):
     capturar_screenshot(page, "debug_01_report")
 
 
-def filtrar_por_status(page):
+SELETOR_FILTRO_STATUS = "input.dt-filter[data-col-index='8']"
+# Tela "No Arrangement found" / "Nenhum Arrangement encontrado" do Report 3PL.
+SELETOR_REPORT_VAZIO = ".report-view .no-result"
+
+
+def report_sem_pedidos(page) -> bool:
+    """True quando o Report 3PL carregou e está vazio (sem tabela e sem filtros).
+
+    O Report 3PL salvo no Zecore só mostra Arrangements criados HOJE (filtro
+    'creation = today'). Nas primeiras execuções do dia (23 a 26/11 às 08:00, e
+    26/11 também às 08:30) ainda não havia nenhum: a página mostra a tela vazia,
+    a tabela nem é montada e os campos de filtro não existem. Isso não é erro.
+    """
+    if page.locator(SELETOR_FILTRO_STATUS).count():
+        return False
+    vazio = page.locator(SELETOR_REPORT_VAZIO)
+    if not (vazio.count() and vazio.first.is_visible()):
+        return False
+    # Confirma que não é um estado passageiro durante o carregamento.
+    page.wait_for_timeout(4_000)
+    return (not page.locator(SELETOR_FILTRO_STATUS).count()
+            and vazio.count() > 0 and vazio.first.is_visible())
+
+
+def esperar_filtros_ou_vazio(page, timeout: int):
+    """Espera aparecer o filtro de status ou a tela vazia do Report 3PL."""
+    # ':visible' em cada lado: a tela vazia continua no HTML (escondida) quando há pedidos.
+    page.locator(f"{SELETOR_FILTRO_STATUS}:visible, {SELETOR_REPORT_VAZIO}:visible").first.wait_for(
+        state="visible", timeout=timeout)
+
+
+def filtrar_por_status(page) -> bool:
+    """Aplica o filtro 'Ready To Ship'. Retorna False se o Report 3PL está vazio hoje."""
     print("\n🔍  Filtrando por 'Ready To Ship'...")
-    campo = page.locator("input.dt-filter[data-col-index='8']")
+    campo = page.locator(SELETOR_FILTRO_STATUS)
     try:
         try:
-            campo.wait_for(timeout=15_000)
+            esperar_filtros_ou_vazio(page, 15_000)
         except PlaywrightTimeout:
-            # 23, 24 e 25/11 às 08:00 (1ª execução do dia): o Report 3PL abriu sem os
-            # filtros e o bot desistia. Recarregar a página uma vez costuma resolver.
-            print("   ⚠️  Filtros do Report 3PL não apareceram — recarregando a página uma vez...")
+            # A página não mostrou nem a tabela nem a tela vazia: recarrega uma vez.
+            print("   ⚠️  Report 3PL não terminou de carregar — recarregando a página uma vez...")
             try:
                 page.reload(wait_until="networkidle", timeout=45_000)
             except PlaywrightTimeout:
                 pass
             page.wait_for_timeout(4_000)
-            campo.wait_for(timeout=20_000)
+            esperar_filtros_ou_vazio(page, 20_000)
+        if report_sem_pedidos(page):
+            print("ℹ️  Report 3PL vazio: nenhum Arrangement 3PL criado hoje ainda.")
+            capturar_screenshot(page, "debug_02_report_vazio")
+            return False
+        campo.wait_for(timeout=15_000)
         campo.click()
         campo.fill("Ready To Ship")
         campo.press("Enter")
         page.wait_for_timeout(3_500)
         print("✅  Filtro de status aplicado!")
         capturar_screenshot(page, "debug_02_filtro_status")
+        return True
     except PlaywrightTimeout:
         print("❌  Filtro de status não encontrado.")
         capturar_screenshot(page, "debug_02_erro_status")
@@ -1397,13 +1434,39 @@ def main():
         page = context.new_page()
 
         try:
+            # 0. Rodonaves: NOTFIS das NFs etiquetadas depois das 12:00 do dia anterior.
+            #    Vem antes do Zecore para sair mesmo se o Report 3PL ainda estiver vazio.
+            if "RODONAVES" in transportadora.upper():
+                fila = enviar_notfis_pendentes(PASTA_XMLS)
+                if fila:
+                    if fila["email"] is True:
+                        resumo_ci([f"📄 NOTFIS da fila (etiquetadas depois das 12:00): "
+                                   f"{fila['nfs']} NF(s) enviada(s) para a RTE."])
+                    elif fila["email"] is False:
+                        anotar_ci("warning", "NOTFIS da fila não enviado",
+                                  f"{fila['nfs']} NF(s) continuam na fila para a próxima execução da manhã.")
+
             # 1. Login
             if not fazer_login(page, email, senha):
                 raise FalhaBot("Falha no login do Zecore.")
 
             # 2. Report + filtros
             navegar_para_report(page)
-            filtrar_por_status(page)
+            if not filtrar_por_status(page):
+                # Vazio cedo é normal (nenhum 3PL criado hoje ainda). Vazio a partir das 10h
+                # de Brasília é suspeito (report salvo ou filtros do usuário do bot alterados):
+                # o run continua verde, mas fica um aviso amarelo para não passar despercebido.
+                if (time.gmtime().tm_hour - 3) % 24 >= 10:
+                    anotar_ci("warning", f"Bot {transportadora}",
+                              "Report 3PL vazio depois das 10h (Brasília): confira o report "
+                              "salvo REPORT 3PL e os filtros do usuário do bot no Zecore.")
+                resumo_ci([f"### {transportadora}",
+                           "Report 3PL ainda vazio hoje (nenhum pedido 3PL criado hoje no Zecore)."])
+                enviar_notificacao_vazia(
+                    "Report 3PL ainda vazio hoje: nenhum pedido 3PL criado hoje no Zecore.",
+                    transportadora=transportadora
+                )
+                return
             filtrar_por_carrier(page, transportadora)
             pedidos = ler_pedidos(page, transportadora)
 

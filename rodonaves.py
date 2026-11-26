@@ -16,9 +16,10 @@ Variáveis (GitHub Secrets / .env):
 
 import os
 import json
+import base64
 import smtplib
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, time as dtime, timedelta, timezone
 from email import encoders
 from email.mime.base import MIMEBase
 from email.mime.text import MIMEText
@@ -45,6 +46,105 @@ def notfis_ja_enviados() -> set[str]:
 def registrar_notfis_enviados(chaves) -> None:
     todas = sorted(notfis_ja_enviados() | set(chaves))
     ARQUIVO_NOTFIS_ENVIADOS.write_text(json.dumps({"chaves": todas}, indent=2) + "\n", encoding="utf-8")
+
+
+# ── NOTFIS só de manhã ──────────────────────────────────────────────────────
+# Regra combinada em 26/11: o NOTFIS da Rodonaves só vai para a RTE nas execuções
+# até a das 12:00. Depois disso o bot só gera a etiqueta; as NFs ficam na fila
+# (notfis_pendentes.json, com o XML) e o NOTFIS delas sai na primeira execução
+# da manhã seguinte (dia útil seguinte, pelo cron).
+# O disparo das 12:00 costuma começar alguns minutos depois, por isso o corte é 12:15.
+FUSO_BR = timezone(timedelta(hours=-3), "BRT")   # Brasília (sem horário de verão desde 2019)
+CORTE_NOTFIS = dtime(12, 15)
+ARQUIVO_NOTFIS_PENDENTES = Path("notfis_pendentes.json")
+
+
+def agora_br() -> datetime:
+    return datetime.now(FUSO_BR)
+
+
+# Hora em que esta execução começou (import do módulo, no início do bot). A decisão
+# do NOTFIS usa o INÍCIO da execução, não a hora em que a Rodonaves é processada:
+# o disparo das 12:00 só chega nessa etapa uns 10–15 min depois e passaria do corte.
+INICIO_EXECUCAO = agora_br()
+
+
+def notfis_no_horario(agora: datetime | None = None) -> bool:
+    """True se esta execução ainda pode enviar NOTFIS (começou antes do corte)."""
+    return (agora or INICIO_EXECUCAO).time() < CORTE_NOTFIS
+
+
+def carregar_notfis_pendentes() -> list[dict]:
+    try:
+        return json.loads(ARQUIVO_NOTFIS_PENDENTES.read_text(encoding="utf-8")).get("itens", [])
+    except (FileNotFoundError, ValueError):
+        return []
+
+
+def salvar_notfis_pendentes(itens: list[dict]) -> None:
+    ARQUIVO_NOTFIS_PENDENTES.write_text(
+        json.dumps({"itens": itens}, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+
+def adiar_notfis(xmls: list[bytes]) -> int:
+    """Põe as NFs na fila do NOTFIS do dia seguinte. Devolve quantas entraram agora."""
+    itens = carregar_notfis_pendentes()
+    na_fila = {i["chave"] for i in itens}
+    hoje = agora_br().date().isoformat()
+    novas = 0
+    for dados in xmls:
+        chave = _chave(dados)
+        if chave in na_fila:
+            continue
+        itens.append({"chave": chave, "nf": int(chave[25:34]), "data": hoje,
+                      "xml_b64": base64.b64encode(dados).decode("ascii")})
+        na_fila.add(chave)
+        novas += 1
+    if novas:
+        salvar_notfis_pendentes(itens)
+    return novas
+
+
+def enviar_notfis_pendentes(pasta: Path) -> dict | None:
+    """Na manhã seguinte: manda num NOTFIS as NFs que ficaram na fila depois do corte.
+
+    Roda no começo da execução da Rodonaves, antes do Zecore, para não depender de
+    haver pedido novo no Report 3PL. Fora do horário, ou sem fila, não faz nada.
+    """
+    itens = carregar_notfis_pendentes()
+    if not itens or not notfis_no_horario():
+        return None
+
+    enviadas = notfis_ja_enviados()
+    restantes = [i for i in itens if i["chave"] not in enviadas]
+    if len(restantes) < len(itens):
+        print(f"   ℹ️  {len(itens) - len(restantes)} NF(s) da fila já tinham ido em NOTFIS — saem da fila.")
+    if not restantes:
+        salvar_notfis_pendentes([])
+        return None
+
+    nfs = ", ".join(str(i["nf"]) for i in restantes)
+    print(f"\n📄  NOTFIS da fila (etiquetadas depois das 12:00): {len(restantes)} NF(s) — {nfs}")
+    agora = datetime.now()
+    try:
+        conteudo = notfis.gerar_notfis([base64.b64decode(i["xml_b64"]) for i in restantes], agora)
+        pasta.mkdir(parents=True, exist_ok=True)
+        caminho = pasta / f"NOTFIS_LUUNA_{agora:%Y%m%d_%H%M}_PENDENTES.txt"
+        with open(caminho, "w", encoding="ascii", newline="") as f:
+            f.write(conteudo)
+    except Exception as e:
+        print(f"   ❌  Erro ao gerar o NOTFIS da fila: {e} — a fila fica para a próxima execução.")
+        salvar_notfis_pendentes(restantes)
+        return {"nfs": len(restantes), "email": False}
+
+    email = enviar_notfis_por_email([caminho], len(restantes))
+    if email is True:
+        registrar_notfis_enviados([i["chave"] for i in restantes])
+        salvar_notfis_pendentes([])
+    else:
+        # Falhou ou envio desligado: a fila continua para a próxima execução da manhã.
+        salvar_notfis_pendentes(restantes)
+    return {"nfs": len(restantes), "email": email}
 
 COPIA_INTERNA = ["felipe.azevedo@zeb.mx", "israel.lopes@zeb.mx"]
 
@@ -109,7 +209,7 @@ def rodonaves_processar_xmls(arquivos: list[Path], pasta: Path) -> dict:
 
     # NOTFIS só com as notas que têm etiqueta (nota sem etiqueta não sai) e que ainda
     # não foram num NOTFIS enviado. Um arquivo só: o embarcador é sempre a matriz.
-    notfis_paths, notfis_chaves, ja_enviado = [], [], False
+    notfis_paths, notfis_chaves, ja_enviado, adiadas = [], [], False, 0
     if xmls_prontos:
         enviadas = notfis_ja_enviados()
         novas = [(d, rte.ler_nfe(d)) for d in xmls_prontos]
@@ -119,6 +219,12 @@ def rodonaves_processar_xmls(arquivos: list[Path], pasta: Path) -> dict:
             print(f"\n   ℹ️  {repetidas} NF(s) já foram em NOTFIS anterior — não reenviadas.")
         if not novas:
             ja_enviado = True
+        elif not notfis_no_horario():
+            # Depois das 12:00: só etiqueta. O NOTFIS vai na manhã seguinte.
+            entraram = adiar_notfis([d for d, _ in novas])
+            adiadas = len(novas)
+            print(f"\n⏰  Depois das 12:00: NOTFIS de {adiadas} NF(s) fica para a manhã seguinte"
+                  f" ({entraram} entraram na fila agora).")
         else:
             agora = datetime.now()
             try:
@@ -135,7 +241,8 @@ def rodonaves_processar_xmls(arquivos: list[Path], pasta: Path) -> dict:
     print(f"\n   📊  RTE: {len(ok)} etiqueta(s) OK, {len(falha)} falha(s)")
     return {"ok": ok, "falha": falha, "etiquetas_pdfs": etiquetas_pdfs,
             "notfis": notfis_paths or None, "notfis_nfs": len(notfis_chaves),
-            "notfis_chaves": notfis_chaves, "notfis_ja_enviado": ja_enviado}
+            "notfis_chaves": notfis_chaves, "notfis_ja_enviado": ja_enviado,
+            "notfis_adiado": adiadas}
 
 
 def _chave(xml_bytes: bytes) -> str:
@@ -213,6 +320,9 @@ def resumo_chat(res: dict) -> str:
     email = res.get("notfis_email")
     if res.get("notfis_ja_enviado"):
         txt += "\n📄 *NOTFIS:* NF(s) desta rodada já tinham ido em NOTFIS anterior — nada reenviado"
+    if res.get("notfis_adiado"):
+        txt += (f"\n⏰ *NOTFIS:* {res['notfis_adiado']} NF(s) etiquetada(s) depois das 12:00 —"
+                " o NOTFIS vai para a RTE na manhã seguinte")
     if res.get("notfis"):
         if email is True:
             txt += f"\n📄 *NOTFIS:* {res.get('notfis_nfs', 0)} NF(s) enviada(s) para a RTE"
@@ -237,7 +347,8 @@ def rodonaves_nao_rodou(res: dict | None) -> bool:
         return False
     if any(res.get(k) for k in ("pulado", "erro_login", "platinum_pulado")):
         return True
-    if res.get("etiquetas_pdfs") and not res.get("notfis") and not res.get("notfis_ja_enviado"):
+    if (res.get("etiquetas_pdfs") and not res.get("notfis") and not res.get("notfis_ja_enviado")
+            and not res.get("notfis_adiado")):
         # etiquetas prontas, mas o NOTFIS não foi gerado
         return True
     return bool(res.get("notfis")) and res.get("notfis_email") is False

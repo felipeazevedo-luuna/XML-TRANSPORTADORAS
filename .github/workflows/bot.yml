@@ -133,6 +133,9 @@ jobs:
           [ -f notfis_enviados.json ] && git add notfis_enviados.json
           [ -f email_enviados.json ] && git add email_enviados.json
           [ -f nfs_processadas.json ] && git add nfs_processadas.json
+          # Fila do NOTFIS da Rodonaves (NFs etiquetadas depois das 12:00). Só o job da
+          # RODONAVES escreve esse arquivo, e nunca dois ao mesmo tempo (concurrency).
+          [ -f notfis_pendentes.json ] && git add notfis_pendentes.json
           if git diff --staged --quiet; then
             echo "Nada novo no histórico."
             exit 0
@@ -165,7 +168,15 @@ jobs:
             git show FETCH_HEAD:nfs_processadas.json > /tmp/np_remoto.json 2>/dev/null || echo '{"itens":[]}' > /tmp/np_remoto.json
             [ -f nfs_processadas.json ] || echo '{"itens":[]}' > nfs_processadas.json
             jq -s '{itens: (((.[0].itens // []) + (.[1].itens // [])) | unique)}' nfs_processadas.json /tmp/np_remoto.json > /tmp/np_juntado.json
+            # notfis_pendentes.json: vale a versão deste job (só a RODONAVES mexe nela;
+            # união aqui traria de volta NFs que este job acabou de enviar).
+            # No job da JAMEF o arquivo é só a cópia do checkout: ali vale o da main.
+            rm -f /tmp/pend_local.json
+            case "$TRANSPORTADORA" in
+              *RODONAVES*) [ -f notfis_pendentes.json ] && cp notfis_pendentes.json /tmp/pend_local.json ;;
+            esac
             git reset --hard FETCH_HEAD
+            [ -f /tmp/pend_local.json ] && mv /tmp/pend_local.json notfis_pendentes.json && git add notfis_pendentes.json
             mv /tmp/juntado.json historico_processados.json
             mv /tmp/nf_juntado.json notfis_enviados.json
             mv /tmp/em_juntado.json email_enviados.json
